@@ -22,9 +22,14 @@ contract Dgrid is
     uint256 public commissionRate;
     mapping(address => mapping(address => uint256)) public commission;
     mapping(address => Asset) public assetInfos;
+    mapping(uint256 => bool) public fulfilledOrders;
     address[] public assetList;
     uint256[] public priceSteps; // price steps, e.g. [600, 550, 500]
     uint256[] public stepRanges; // step ranges, e.g. [9, 49, type(uint256).max]
+
+    constructor() {
+        _disableInitializers();
+    }
 
     struct Asset {
         address token;
@@ -96,6 +101,7 @@ contract Dgrid is
         bytes calldata signature,
         address asset
     ) public payable nonReentrant {
+        require(!fulfilledOrders[orderId], "Order already fulfilled");
         require(
             asset == address(0) || assetInfos[asset].token != address(0),
             "Invalid asset"
@@ -107,17 +113,26 @@ contract Dgrid is
 
         // get the eth signed message hash
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
-            abi.encode(orderId, user, parent, nodeCount, expireTime)
+            abi.encode(
+                block.chainid,
+                orderId,
+                user,
+                parent,
+                nodeCount,
+                expireTime
+            )
         );
         // recover the signer address from the signature
         address signer = ECDSA.recover(ethSignedMessageHash, signature);
         // check if the signer is the authorized server address
         require(signer == server, "Invalid Signature");
+        fulfilledOrders[orderId] = true;
         uint256 paymentAmount = calculatePaymentAmount(nodeCount);
         uint256 payValue = 0;
         uint256 commissionAmount;
         if (asset == address(0)) {
-            uint256 bnbPrice = priceFeed.fetchPrice();
+            // pay with bnb
+            uint256 bnbPrice = priceFeed.fetchPrice(address(0));
             uint256 paymentAmountInBnb = (paymentAmount * 1e18) / bnbPrice;
             require(
                 msg.value >= paymentAmountInBnb,
@@ -143,9 +158,10 @@ contract Dgrid is
                 ); //refund bnb to user
             }
         } else {
-            Asset memory assetInfo = assetInfos[asset];
+            // pay with erc20 asset
+            uint256 assetPrice = priceFeed.fetchPrice(asset);
             uint256 paymentAmountInAsset = (paymentAmount *
-                10 ** assetInfo.decimals) / 1e18;
+                10 ** assetInfos[asset].decimals) / assetPrice;
             uint256 allowance = ERC20(asset).allowance(
                 msg.sender,
                 address(this)

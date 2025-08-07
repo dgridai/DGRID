@@ -10,6 +10,10 @@ contract DgridNode is ERC1155Upgradeable, OwnableUpgradeable {
     address public dgrid;
     mapping(uint256 => uint256) public totalSupply;
 
+    constructor() {
+        _disableInitializers();
+    }
+
     modifier onlyDgrid() {
         require(msg.sender == dgrid, "Only Dgrid can call this function");
         _;
@@ -37,12 +41,6 @@ contract DgridNode is ERC1155Upgradeable, OwnableUpgradeable {
         totalSupply[id] += amount;
     }
 
-    // only owner can burn
-    function burn(address from, uint256 id, uint256 amount) external onlyOwner {
-        _burn(from, id, amount);
-        totalSupply[id] -= amount;
-    }
-
     //when transfer, check public transfer enabled or not
     function _update(
         address from,
@@ -50,8 +48,8 @@ contract DgridNode is ERC1155Upgradeable, OwnableUpgradeable {
         uint256[] memory ids,
         uint256[] memory values
     ) internal override {
-        if (from != address(0) && to != address(0) && publicTransferEnabled) {
-            revert("Only owner can transfer");
+        if (from != address(0) && to != address(0) && !publicTransferEnabled) {
+            revert("Transfer is not enabled");
         }
         super._update(from, to, ids, values);
     }
