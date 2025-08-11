@@ -311,4 +311,13 @@ contract Dgrid is
         stepRanges = _ranges;
         priceSteps = _prices;
     }
+
+    function setAssets(address[] memory _assets) public onlyOwner {
+        for (uint256 i = 0; i < _assets.length; i++) {
+            assetInfos[_assets[i]] = Asset({
+                token: _assets[i],
+                decimals: ERC20(_assets[i]).decimals()
+            });
+        }
+    }
 }

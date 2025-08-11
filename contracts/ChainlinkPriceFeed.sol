@@ -37,9 +37,9 @@ contract ChainlinkPriceFeed is Ownable {
     // Add price feed mapping
     mapping(address => AggregatorV3Interface) public priceFeeds;
     mapping(address => uint8) public feedDecimals;
-    uint32 public immutable heartbeat; // max allow time to update price
+    uint32 public heartbeat; // max allow time to update price
     uint256 public constant TARGET_DIGITS = 18;
-    uint256 public constant MAX_PRICE_DEVIATION = 5e17; // 50%
+    uint256 public MAX_PRICE_DEVIATION = 5e17; // 50%
 
     // price cache
     mapping(address => uint256) public lastPrice;
@@ -65,6 +65,11 @@ contract ChainlinkPriceFeed is Ownable {
 
     /// @notice get latest price (auto cache, only get once in one block)
     function fetchPrice(address asset) public returns (uint256) {
+        require(
+            priceFeeds[asset] != AggregatorV3Interface(address(0)),
+            "Invalid price feed"
+        );
+
         // if price is cached in this block, return directly
         if (lastBlock[asset] == block.number && lastPrice[asset] != 0) {
             return lastPrice[asset];
@@ -134,5 +139,15 @@ contract ChainlinkPriceFeed is Ownable {
     function setPriceFeed(address asset, address priceFeed) external onlyOwner {
         priceFeeds[asset] = AggregatorV3Interface(priceFeed);
         feedDecimals[asset] = priceFeeds[asset].decimals();
+    }
+
+    function setHeartbeat(uint32 _heartbeat) external onlyOwner {
+        heartbeat = _heartbeat;
+    }
+
+    function setMaxPriceDeviation(
+        uint256 _maxPriceDeviation
+    ) external onlyOwner {
+        MAX_PRICE_DEVIATION = _maxPriceDeviation;
     }
 }
