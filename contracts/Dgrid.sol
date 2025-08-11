@@ -65,6 +65,7 @@ contract Dgrid is
     }
 
     function initialize(
+        address _owner,
         address _server,
         address _dev,
         address _priceFeed,
@@ -74,7 +75,7 @@ contract Dgrid is
         uint256[] memory _priceSteps,
         uint256[] memory _stepRanges
     ) public initializer {
-        __Ownable_init(msg.sender);
+        __Ownable_init(_owner);
         __ReentrancyGuard_init();
         server = _server;
         dev = _dev;
