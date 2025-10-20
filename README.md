@@ -1,150 +1,113 @@
-# DGRID Product Analysis
+## DGRID Project Documentation (English)
 
-Empowering On-Chain Commerce: Transparent Node Sales, Tiered Pricing, and Automated Commissions.
+### Overview
 
-## I. Product Positioning
+DGRID is an upgradeable on-chain commerce module for selling ERC-721 “nodes” with:
 
-DGRID is a decentralized, upgradeable module for selling ERC-1155 “nodes” with fair, transparent pricing and automated referral commissions. It supports native and ERC-20 payments with Chainlink-powered price conversion, enabling straightforward integration for dApps and platforms.
+- Multi-asset payment (native token or ERC-20) via Chainlink price conversion
+- Automated referral commissions
+- Per-order pricing and configurable lock-amount per node
+- Transfer-gated NFTs, plus a staking pool with multi-reward support
 
-## II. Core Value Proposition
+Core contracts:
 
-- **Transparent Pricing** – Tiered per-order pricing based on quantity, enforced on-chain.
-- **Multi-Asset Payments** – Native token or ERC-20 assets with oracle conversion.
-- **Automated Commissions** – Configurable commission rate, accrued by referrers and claimable anytime.
-- **Upgradeable & Secure** – Non-reentrant flows, server-signed orders, and oracle safety.
+- `contracts/Dgrid.sol`: purchase, pricing, commission, minting, lock transfer, pause/emergency
+- `contracts/DgridNode.sol`: ERC-721 node NFT with transfer gating and stake/jail flags
+- `contracts/DgridStakePool.sol`: staking for node NFTs with multi reward tokens
+- `contracts/DgridLock.sol`: lock vault receiving the locked portion of payments
+- `contracts/ChainlinkPriceFeed.sol`: oracle adapter (cache, heartbeat, deviation guard)
 
-## III. Feature Overview
+### Roles
 
-### 1. Server-Signed Node Purchases
+- Owner: config/admin (prices, feeds, assets, params, pause)
+- Server: authorized signer for orders and staking operations
+- Dev: receives net payment after commission and lock
+- DgridLock Operator: withdraws locked funds per policy
+- User: purchaser and/or recipient; Referrer (parent) accrues commission
 
-- Off-chain signature by `server` authorizes an order with `(chainId, orderId, user, parent, nodeCount, expireTime)`.
-- On-chain validation prevents forgery, replays, and expired orders.
-- Payer can differ from the `user` (supports custodial/3rd-party payments).
+### Key Features
 
-### 2. Tiered Pricing & Oracle Conversion
+- Server-signed order: `(chainId, orderId, user, parent, nodeCount, expireTime)` with EIP-191 signature
+- Pricing and lock:
+  - `nodePrice`: price per node in 18 decimals
+  - `lockAmountPerNode`: lock portion per node in 18 decimals
+  - `calculatePaymentAmount(nodeCount)` = `nodePrice * nodeCount * 1e18`
+  - `calculateLockAmount(nodeCount)` = `lockAmountPerNode * nodeCount * 1e18`
+- Commission: `(paidAmount * commissionRate) / 100` credited to `commission[parent][asset]`
+- Payments:
+  - Native: convert with `fetchPrice(address(0))`; refund excess `msg.value`
+  - ERC-20: allowance check + `safeTransferFrom`, using token decimals
+- Lock routing: lock portion → `dgridLock`; net proceeds → `dev`
+- ERC-721 minting: mints sequential `NODE_ID` to `user`; transfers disabled by default
+- Staking pool: stake/unstake with per-block multi-token rewards; server-signed deposit; jail/unjail controls
 
-- `priceSteps` + `stepRanges` select a per-order price per node (non-incremental).
-- Conversion via `ChainlinkPriceFeed.fetchPrice(asset)` to native/ERC-20 amounts.
-- Defaults if unset: `priceSteps = [600, 550, 500]`, `stepRanges = [9, 49, type(uint256).max]`.
+### Purchase Flow
 
-### 3. Commission System
+1. Off-chain: `server` signs payload `abi.encode(chainId, orderId, user, parent, nodeCount, expireTime)` and EIP-191 wrap.
+2. On-chain: call `buyNode(orderId, user, parent, nodeCount, expireTime, signature, asset)`:
+   - Validates signature, `expireTime`, asset allowlist, and unique `orderId`
+   - Computes payment + lock, converts via `ChainlinkPriceFeed.fetchPrice`
+   - Handles commission, lock transfer to `dgridLock`, net to `dev`, refund (if native)
+   - Mints `nodeCount` NFTs to `user`
+   - Emits `Locked` and `BuyNode`
 
-- Commission accrues per `parent` per `asset`: `commission[parent][asset]`.
-- `commissionRate` is percentage (e.g., `10` means 10%).
-- Users claim their accrued balances across all configured assets plus native.
+### Staking Flow (DgridStakePool)
 
-### 4. Transfer-Gated ERC-1155 Nodes
+- Server-signed deposit: `abi.encode(chainId, nodeIds, staker, expireTime)`
+- `deposit(nodeIds, staker, expireTime, signature)`: stakes NFTs, updates rewards accrual
+- Rewards:
+  - Multiple `rewardToken` entries with `rewardPerBlock`
+  - `pendingRewards(user)` and `harvest()` to claim
+- Moderation:
+  - `jailNodes([{owner, tokenIds}, ...])` by `server` reduces stake and marks jailed
+  - `unjailNodes(nodeIds, owner)` restores stake after checks
+- Pausable; emergency withdraw for reward tokens when paused
 
-- Node `id = 1` minted to `user` upon purchase.
-- Transfers are disabled by default and can be enabled by owner.
+### Oracle and Safety (ChainlinkPriceFeed)
 
-### 5. Oracle & Safety Controls
+- Per-block caching of price; staleness guard via `heartbeat`
+- Deviation guard vs last cached price (`MAX_PRICE_DEVIATION`, default 50%)
+- All prices scaled to 18 decimals
+- Requires configuring feed for native via `asset == address(0)`
 
-- Heartbeat staleness check, optional price deviation guard (default 50%).
-- Per-block price caching to save gas.
-- All prices normalized to 18 decimals for consistent math.
+### Admin and Configuration
 
-### 6. Lifecycle
+- `Dgrid.sol`
+  - `initialize(owner, server, dev, priceFeed, dgridNodeProxy, commissionRate, assets, nodePrice, dgridLock, lockAmountPerNode)`
+  - `setCommissionRate(uint256<=100)`, `setServer(address)`, `setDev(address)`
+  - `setPriceFeed(address)`, `setAssets(address[])`, `setNodePrice(uint256)`, `setLockAmountPerNode(uint256)`, `setDgridLock(address)`
+  - `pause()`, `unpause()`, `emergencyWithdraw(address to)` when paused
+- `DgridNode.sol`
+  - `setPublicTransferEnabled(bool)`, `setDgrid(address)`, `setDgridStakePool(address)`
+  - Transfers revert if disabled or if token is staked/jailed
+- `DgridStakePool.sol`
+  - `addRewardToken(token, perBlock)`, `setRewardPerBlock([...])`, `setRewardTokenEnabled(index, enabled)`
+  - `setStartBlock(uint256)`, `setServer(address)`, `pause()`, `unpause()`, `emergencyWithdraw(address to)`
+- `ChainlinkPriceFeed.sol`
+  - `setPriceFeed(asset, aggregator)`, `setHeartbeat(uint32)`, `setMaxPriceDeviation(uint256)`
 
-- **Authorize**: Off-chain signature by `server`.
-- **Purchase**: On-chain buy, price conversion, commission accrual, minting.
-- **Claim**: Referrers claim accrued commissions.
-- **Enable Transfers**: Owner may open public transfers when ready.
+### Events (selected)
 
-### 7. Node Economics
+- Dgrid: `BuyNode`, `Locked`, `ClaimCommission`, `Pause`, `Unpause`, `EmergencyWithdraw`
+- DgridNode: `Mint`, `Stake`, `Unstake`, `Jail`, `Unjail`
+- DgridStakePool: `Deposit`, `JailNodes`, `UnjailNodes`, `Harvest`, `Update*`, `Pause`, `Unpause`, `EmergencyWithdraw`
 
-- Single node type `NODE_ID = 1`.
-- Total cost per order = `pricePerNode(nodeCount) * nodeCount * 1e18`.
-- Commission per order = `(payValue * commissionRate) / 100`.
+### Development
 
-## IV. Key Features Breakdown
-
-| Feature Module           | Implementation                                       | User Value                                          |
-| ------------------------ | ---------------------------------------------------- | --------------------------------------------------- |
-| Server-Signed Purchases  | EIP-191 signature with expire/orderId validation     | Prevents forgery/replays; predictable purchase flow |
-| Tiered Pricing           | `priceSteps` + `stepRanges`                          | Fair, transparent per-order pricing                 |
-| Multi-Asset Payments     | Native + ERC-20, Chainlink conversion                | Flexible payment with accurate conversion           |
-| Referral Commissions     | On-chain accrual per parent/asset + claim            | Simple and auditable incentives for growth          |
-| ERC-1155 Node Minting    | `DgridNode` with transfer gating                     | Controlled distribution; can open transfers later   |
-| Oracle Safety            | Heartbeat + deviation guard + per-block caching      | Reliable, gas-efficient, and safe pricing           |
-| Upgradeable Architecture | Initializable + OwnableUpgradeable + ReentrancyGuard | Secure, maintainable, and future-proof              |
-
-## V. Technical Highlights
-
-- **Security**: `nonReentrant` on purchase/claim; unique `orderId`; signed order with `chainId` and `expireTime`.
-- **Oracle Robustness**: Staleness and deviation checks; 18-decimal normalization; per-block caching.
-- **Asset Handling**: Native path refunds excess; ERC-20 via low-level `transfer`/`transferFrom` with success checks.
-- **Access Control**: Owner manages params; only `Dgrid` can mint; `DgridNode` owner controls transfer enablement.
-- **Upgradeable**: Uses `Initializable`, `OwnableUpgradeable`, `ReentrancyGuardUpgradeable`.
-
-## VI. Key FAQs
-
-- **Q: What fees are involved?**  
-  A: Payments are split into developer proceeds and optional referral commissions per configured `commissionRate`.
-
-- **Q: How is price determined?**  
-  A: By the configured tier (`priceSteps`/`stepRanges`) based on `nodeCount`, then converted via Chainlink to the payment asset.
-
-- **Q: How are commissions claimed?**  
-  A: Referrers call `claimCommission(user)` to receive accrued balances across supported ERC-20s and native token.
-
-- **Q: Can transfers be enabled later?**  
-  A: Yes. `DgridNode` starts with transfers disabled; owner can enable them via `setPublicTransferEnabled(true)`.
-
-- **Q: Does the payer have to be the recipient?**  
-  A: No. The caller/payer can be different from `user`.
-
-## VII. Smart Contract Development
-
-**Contracts**
-
-- `contracts/Dgrid.sol`
-- `contracts/DgridNode.sol`
-- `contracts/ChainlinkPriceFeed.sol`
-
-**Installation**
+- Install
 
 ```bash
 npm install
 ```
 
-**Compile**
+- Compile
 
 ```bash
 npx hardhat compile
 ```
 
-**Test**
+### Notes
 
-```bash
-npx hardhat test
-```
-
-**Deploy (example)**
-
-```bash
-npx hardhat run scripts/deploy.ts --network bsc
-# or
-npx hardhat run scripts/deploy.js --network bsc
-```
-
-**Verify**
-
-```bash
-npx hardhat verify --network bsc <contract_address> [constructor_args...]
-```
-
-## VIII. Contract Interfaces (Admin & Events)
-
-- Admin (on `Dgrid`):
-  - `setCommissionRate(uint256)`
-  - `setServer(address)`
-  - `setDev(address)`
-  - `setPriceFeed(address)`
-  - `setPriceSteps(uint256[] ranges, uint256[] prices)` (lengths must match)
-  - `setAssets(address[] assets)`
-- Admin (on `DgridNode`):
-  - `setPublicTransferEnabled(bool)`
-- Events:
-  - `BuyNode(orderId, user, parent, nodeCount, asset, payValue, commissionAmount)`
-  - `ClaimCommission(user, assets, amounts)`
+- Anyone can call `claimCommission(_user, assets[])`; funds are transferred to `_user` and balances zeroed.
+- Ensure native price feed (`address(0)`) configured before enabling native purchases.
+- Audit: see `audits/Metatrust_Dgrid.pdf`.

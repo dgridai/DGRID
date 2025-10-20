@@ -61,6 +61,9 @@ contract ChainlinkPriceFeed is Ownable {
             feedDecimals[_tokens[i]] = priceFeeds[_tokens[i]].decimals();
         }
         heartbeat = _heartbeat;
+        for (uint256 i = 0; i < _tokens.length; i++) {
+            fetchPrice(_tokens[i]); //init cache
+        }
     }
 
     /// @notice get latest price (auto cache, only get once in one block)
