@@ -19,14 +19,16 @@ contract DgridStakePool is
     using SafeERC20 for ERC20;
 
     struct UserInfo {
-        uint256 amount; // user staked amount
-        uint256[] rewardDebt; // reward debt (for settlement)
+        uint256 amount; //user staked amount
+        uint256[] rewardDebt; //reward debt
+        uint256[] unpaidRewards; //unpaid rewards
+        uint256[] paidRewards; //paid rewards: rewardIndex => amount
     }
 
-    struct RewardInfo {
-        ERC20 rewardToken; // reward token
-        uint256 rewardPerBlock; // reward per block
-        bool enabled; // is enabled
+    struct RewardTokenInfo {
+        ERC20 rewardToken; //reward token
+        uint256 rewardPerBlock; //reward per block
+        bool enabled; //enabled
     }
 
     struct JailInfo {
@@ -34,24 +36,25 @@ contract DgridStakePool is
         uint256[] tokenIds;
     }
 
+    // paused
+    bool public paused;
+
     // server
     address public server;
 
-    // configuration
-    uint256 public startBlock; // start block
-    uint256 public lastRewardBlock; // last reward block
-
-    RewardInfo[] public rewardInfos; // reward information
-    uint256[] public accPerShares; // accumulated per share (expand ACC_PRECISION)
-    uint256 public constant ACC_PRECISION = 1e18;
-    uint256 public totalStaked; // total staked amount
-    mapping(address => UserInfo) public userInfo; // user -> info
-
+    // dgrid node
     IDgridNode public dgridNode;
 
-    mapping(address => uint256[]) public unpaidRewards; // unpaid rewards book: user -> [rewardIndex => amount]
+    // configuration
+    uint256 public startBlock; //start block
+    uint256 public lastRewardBlock; //last reward block
 
-    bool public paused;
+    RewardTokenInfo[] public rewardTokenInfos; //reward token infos
+    uint256[] public accPerShares; //acc per shares (expanded ACC_PRECISION)
+    uint256 public constant ACC_PRECISION = 1e18;
+    uint256 public totalStaked; //total staked amount
+    mapping(address => UserInfo) public userInfo; //user -> info
+    // mapping(address => uint256[]) public unpaidRewards; //unpaid rewards: user -> [rewardIndex => amount]
 
     event Deposit(address indexed user, uint256[] tokenIds);
     event JailNodes(address indexed user, uint256[] tokenIds);
@@ -75,7 +78,7 @@ contract DgridStakePool is
         uint256 amount
     );
     event Pause(address operator, bool paused);
-    event Unpause(address operator, bool unpaused);
+    event Unpause(address operator, bool paused);
     event EmergencyWithdraw(address to, address token, uint256 amount);
 
     modifier onlyServer() {
@@ -122,8 +125,8 @@ contract DgridStakePool is
                 "reward token is zero address"
             );
             require(_rewardPerBlocks[i] > 0, "reward per block is zero");
-            rewardInfos.push(
-                RewardInfo({
+            rewardTokenInfos.push(
+                RewardTokenInfo({
                     rewardToken: ERC20(_rewardTokens[i]),
                     rewardPerBlock: _rewardPerBlocks[i],
                     enabled: true
@@ -133,7 +136,7 @@ contract DgridStakePool is
         }
     }
 
-    // add reward token
+    //add reward token
     function addRewardToken(
         address _rewardToken,
         uint256 _rewardPerBlock
@@ -141,8 +144,8 @@ contract DgridStakePool is
         require(_rewardToken != address(0), "reward token is zero address");
         require(_rewardPerBlock > 0, "reward per block is zero");
         updatePool();
-        rewardInfos.push(
-            RewardInfo({
+        rewardTokenInfos.push(
+            RewardTokenInfo({
                 rewardToken: ERC20(_rewardToken),
                 rewardPerBlock: _rewardPerBlock,
                 enabled: true
@@ -151,42 +154,47 @@ contract DgridStakePool is
         accPerShares.push(0);
     }
 
-    // update reward status of a single pool
+    //update pool reward status
     function updatePool() public {
         if (block.number <= lastRewardBlock) {
             return;
         }
 
-        if (totalStaked == 0 || rewardInfos.length == 0) {
+        if (totalStaked == 0 || rewardTokenInfos.length == 0) {
             lastRewardBlock = block.number;
             return;
         }
 
         uint256 blocks = block.number - lastRewardBlock;
-        for (uint256 i = 0; i < rewardInfos.length; i++) {
-            if (!rewardInfos[i].enabled) {
-                continue; // do not calculate disabled rewards
+        for (uint256 i = 0; i < rewardTokenInfos.length; i++) {
+            if (!rewardTokenInfos[i].enabled) {
+                continue; //not calculate disabled rewards
             }
-            uint256 reward = blocks * rewardInfos[i].rewardPerBlock;
-            accPerShares[i] += (reward * ACC_PRECISION) / totalStaked; // calculate accumulated per share
+            uint256 reward = blocks * rewardTokenInfos[i].rewardPerBlock;
+            accPerShares[i] += (reward * ACC_PRECISION) / totalStaked; //calculate acc per shares
         }
         lastRewardBlock = block.number;
     }
 
-    // check pending rewards
-    function pendingRewards(
+    //view user reward info
+    function rewardInfo(
         address _user
     )
         external
         view
-        returns (address[] memory rewardTokens, uint256[] memory rewards)
+        returns (
+            address[] memory rewardTokens,
+            uint256[] memory pendingRewards,
+            uint256[] memory paidRewards
+        )
     {
-        uint256 n = rewardInfos.length;
+        uint256 n = rewardTokenInfos.length;
         rewardTokens = new address[](n);
-        rewards = new uint256[](n);
+        pendingRewards = new uint256[](n);
+        paidRewards = new uint256[](n);
 
         if (n == 0) {
-            return (rewardTokens, rewards);
+            return (rewardTokens, pendingRewards, paidRewards);
         }
 
         UserInfo storage user = userInfo[_user];
@@ -196,22 +204,24 @@ contract DgridStakePool is
 
         for (uint256 i = 0; i < n; i++) {
             uint256 acc = accPerShares[i];
-            if (blocks > 0 && rewardInfos[i].enabled) {
-                uint256 reward = blocks * rewardInfos[i].rewardPerBlock;
+            if (blocks > 0 && rewardTokenInfos[i].enabled) {
+                uint256 reward = blocks * rewardTokenInfos[i].rewardPerBlock;
                 acc += (reward * ACC_PRECISION) / totalStaked;
             }
             uint256 debt = i < user.rewardDebt.length ? user.rewardDebt[i] : 0;
             uint256 pending = (user.amount * acc) / ACC_PRECISION - debt;
-            uint256 unpaid = i < unpaidRewards[_user].length
-                ? unpaidRewards[_user][i]
+            pendingRewards[i] =
+                pending +
+                (i < user.unpaidRewards.length ? user.unpaidRewards[i] : 0);
+            paidRewards[i] = i < user.paidRewards.length
+                ? user.paidRewards[i]
                 : 0;
-            rewards[i] = pending + unpaid;
-            rewardTokens[i] = address(rewardInfos[i].rewardToken);
+            rewardTokens[i] = address(rewardTokenInfos[i].rewardToken);
         }
-        return (rewardTokens, rewards);
+        return (rewardTokens, pendingRewards, paidRewards);
     }
 
-    // stake/add
+    //stake/add
     function deposit(
         uint256[] memory _nodes,
         address _staker,
@@ -239,8 +249,7 @@ contract DgridStakePool is
         dgridNode.stake(_nodes);
 
         updatePool();
-        _ensureUnpaidLen(_staker);
-        _ensureDebtLen(_staker);
+        _ensureUserInfoLen(_staker);
         _accrueUnpaid(_staker);
         UserInfo storage user = userInfo[_staker];
         user.amount += _nodes.length;
@@ -249,11 +258,12 @@ contract DgridStakePool is
         emit Deposit(_staker, _nodes);
     }
 
+    //server: jail nodes
     function jailNodes(
         JailInfo[] memory _jailInfos
     ) external onlyServer nonReentrant whenNotPaused {
         require(_jailInfos.length > 0, "node ids is empty");
-        updatePool(); // update pool first
+        updatePool(); //first update pool
 
         for (uint256 i = 0; i < _jailInfos.length; i++) {
             JailInfo memory jailInfo = _jailInfos[i];
@@ -268,11 +278,10 @@ contract DgridStakePool is
                 require(!dgridNode.isJailed(tokenId), "node is already jailed");
             }
 
-            dgridNode.jail(jailInfo.tokenIds); // batch jail
+            dgridNode.jail(jailInfo.tokenIds); //batch lock
             UserInfo storage user = userInfo[jailInfo.owner];
             require(user.amount > 0, "user is not staked");
-            _ensureDebtLen(jailInfo.owner);
-            _ensureUnpaidLen(jailInfo.owner);
+            _ensureUserInfoLen(jailInfo.owner);
             _accrueUnpaid(jailInfo.owner);
             user.amount -= jailInfo.tokenIds.length;
             totalStaked -= jailInfo.tokenIds.length;
@@ -281,14 +290,14 @@ contract DgridStakePool is
         }
     }
 
+    //user: unjail nodes
     function unjailNodes(
         uint256[] memory _nodeIds,
         address _owner
     ) external nonReentrant whenNotPaused {
         require(_nodeIds.length > 0, "node ids is empty");
-        updatePool(); // update pool first
-        _ensureUnpaidLen(_owner);
-        _ensureDebtLen(_owner);
+        updatePool(); //first update pool
+        _ensureUserInfoLen(_owner);
         for (uint256 i = 0; i < _nodeIds.length; i++) {
             uint256 nodeId = _nodeIds[i];
             address owner = dgridNode.ownerOf(nodeId);
@@ -304,113 +313,112 @@ contract DgridStakePool is
         emit UnjailNodes(_owner, _nodeIds);
     }
 
-    // only harvest rewards (no principal)
+    //only harvest rewards (no principal)
     function harvest() external nonReentrant whenNotPaused {
         require(block.number >= startBlock, "not started");
         updatePool();
-        _ensureUnpaidLen(msg.sender);
-        _ensureDebtLen(msg.sender);
+        _ensureUserInfoLen(msg.sender);
         _payReward(msg.sender);
         _resetDebt(msg.sender);
     }
 
-    // admin: adjust reward per block
+    //admin: adjust reward per block
     function setRewardPerBlock(
         uint256[] memory _rewardPerBlock
     ) external onlyOwner {
         require(
-            _rewardPerBlock.length == rewardInfos.length,
+            _rewardPerBlock.length == rewardTokenInfos.length,
             "length mismatch"
         );
+        updatePool();
         for (uint256 i = 0; i < _rewardPerBlock.length; i++) {
             emit UpdateRewardPerBlock(
-                address(rewardInfos[i].rewardToken),
-                rewardInfos[i].rewardPerBlock,
+                address(rewardTokenInfos[i].rewardToken),
+                rewardTokenInfos[i].rewardPerBlock,
                 _rewardPerBlock[i]
             );
-            rewardInfos[i].rewardPerBlock = _rewardPerBlock[i];
+            rewardTokenInfos[i].rewardPerBlock = _rewardPerBlock[i];
         }
     }
 
-    // admin: adjust start block
+    //admin: adjust start block
     function setStartBlock(uint256 _startBlock) external onlyOwner {
         require(_startBlock >= block.number, "start < current block");
-        require(block.number < startBlock, "already started");
+        require(block.number < startBlock, "already started"); //if already started, can't set start block
         emit UpdateStartBlock(startBlock, _startBlock);
         startBlock = _startBlock;
         lastRewardBlock = _startBlock;
     }
 
-    // admin: set server address
+    //admin: set server address
     function setServer(address _server) external onlyOwner {
         address oldServer = server;
         server = _server;
         emit UpdateServer(oldServer, _server);
     }
 
-    // accrue unpaid rewards
     function _accrueUnpaid(address _user) internal {
         UserInfo storage user = userInfo[_user];
         if (user.amount == 0) {
             return;
         }
-        for (uint256 i = 0; i < rewardInfos.length; i++) {
+        for (uint256 i = 0; i < rewardTokenInfos.length; i++) {
             uint256 pending = (user.amount * accPerShares[i]) /
                 ACC_PRECISION -
                 user.rewardDebt[i];
             if (pending > 0) {
-                unpaidRewards[_user][i] += pending;
+                user.unpaidRewards[i] += pending;
                 emit AccrueUnpaid(_user, i, pending);
             }
         }
     }
 
-    // pay rewards
     function _payReward(address _user) internal {
         UserInfo storage user = userInfo[_user];
-        for (uint256 i = 0; i < rewardInfos.length; i++) {
+        for (uint256 i = 0; i < rewardTokenInfos.length; i++) {
             uint256 pending = (user.amount * accPerShares[i]) /
                 ACC_PRECISION -
                 user.rewardDebt[i];
-            uint256 unpaid = unpaidRewards[_user][i];
+            uint256 unpaid = user.unpaidRewards[i];
             uint256 toPay = pending + unpaid;
             if (toPay > 0) {
-                unpaidRewards[_user][i] = 0;
-                rewardInfos[i].rewardToken.safeTransfer(_user, toPay);
-                emit Harvest(_user, toPay, address(rewardInfos[i].rewardToken));
+                user.unpaidRewards[i] = 0;
+                user.paidRewards[i] += toPay;
+                rewardTokenInfos[i].rewardToken.safeTransfer(_user, toPay);
+                emit Harvest(
+                    _user,
+                    toPay,
+                    address(rewardTokenInfos[i].rewardToken)
+                );
             }
         }
     }
 
-    // ensure reward debt length
-    function _ensureDebtLen(address _user) internal {
+    function _ensureUserInfoLen(address _user) internal {
         UserInfo storage user = userInfo[_user];
-        if (user.rewardDebt.length == rewardInfos.length) {
-            // if user.rewardDebt length is the same as rewardInfos length, return
+        if (
+            user.rewardDebt.length == rewardTokenInfos.length &&
+            user.unpaidRewards.length == rewardTokenInfos.length &&
+            user.paidRewards.length == rewardTokenInfos.length
+        ) {
             return;
         }
-        uint256 n = rewardInfos.length;
+
+        uint256 n = rewardTokenInfos.length;
         while (user.rewardDebt.length < n) {
-            // handle new rewards, set user.rewardDebt to 0 so that users can calculate accumulated rewards even if they do not interact with the contract
             user.rewardDebt.push(0);
         }
-    }
-
-    // ensure unpaid rewards length
-    function _ensureUnpaidLen(address _user) internal {
-        uint256 n = rewardInfos.length;
-        if (unpaidRewards[_user].length == n) {
-            return;
+        while (user.unpaidRewards.length < n) {
+            user.unpaidRewards.push(0);
         }
-        while (unpaidRewards[_user].length < n) {
-            unpaidRewards[_user].push(0);
+        while (user.paidRewards.length < n) {
+            user.paidRewards.push(0);
         }
     }
 
-    // reset reward debt
     function _resetDebt(address _user) internal {
         UserInfo storage user = userInfo[_user];
-        uint256 n = rewardInfos.length;
+        uint256 n = rewardTokenInfos.length;
         for (uint256 i = 0; i < n; i++) {
             user.rewardDebt[i] =
                 (user.amount * accPerShares[i]) /
@@ -418,55 +426,57 @@ contract DgridStakePool is
         }
     }
 
-    // get reward infos length
-    function rewardInfosLength() external view returns (uint256) {
-        return rewardInfos.length;
+    function rewardTokenInfosLength() external view returns (uint256) {
+        return rewardTokenInfos.length;
     }
 
-    // set reward token enabled
     function setRewardTokenEnabled(
         uint256 _rewardTokenIndex,
         bool _enabled
     ) external onlyOwner {
-        require(_rewardTokenIndex < rewardInfos.length, "index out of range");
-        updatePool(); // update accPerShares first
-        rewardInfos[_rewardTokenIndex].enabled = _enabled;
+        require(
+            _rewardTokenIndex < rewardTokenInfos.length,
+            "index out of range"
+        );
+        updatePool(); //first update accPerShares
+        rewardTokenInfos[_rewardTokenIndex].enabled = _enabled;
         emit UpdateRewardTokenEnabled(
             _rewardTokenIndex,
-            address(rewardInfos[_rewardTokenIndex].rewardToken),
+            address(rewardTokenInfos[_rewardTokenIndex].rewardToken),
             _enabled
         );
     }
 
-    // pause
     function pause() external onlyOwner whenNotPaused {
         paused = true;
         emit Pause(msg.sender, true);
     }
 
-    // unpause
     function unpause() external onlyOwner whenPaused {
         paused = false;
         emit Unpause(msg.sender, false);
     }
 
-    // emergency withdraw
     function emergencyWithdraw(
         address to
     ) external onlyOwner whenPaused nonReentrant {
         require(to != address(0), "to is zero address");
-        for (uint256 i = 0; i < rewardInfos.length; i++) {
-            uint256 balance = rewardInfos[i].rewardToken.balanceOf(
+        for (uint256 i = 0; i < rewardTokenInfos.length; i++) {
+            uint256 balance = rewardTokenInfos[i].rewardToken.balanceOf(
                 address(this)
             );
             if (balance > 0) {
-                rewardInfos[i].rewardToken.safeTransfer(to, balance);
+                rewardTokenInfos[i].rewardToken.safeTransfer(to, balance);
                 emit EmergencyWithdraw(
                     to,
-                    address(rewardInfos[i].rewardToken),
+                    address(rewardTokenInfos[i].rewardToken),
                     balance
                 );
             }
         }
+    }
+
+    function accPerSharesLength() external view returns (uint256) {
+        return accPerShares.length;
     }
 }

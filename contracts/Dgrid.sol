@@ -20,13 +20,12 @@ contract Dgrid is
 
     address public server;
     address public dev;
-    address public dgridLock;
     IDgridNode public dgridNode;
     ChainlinkPriceFeed public priceFeed;
 
     uint256 public NODE_ID;
     uint256 public commissionRate;
-    uint256 public lockAmountPerNode;
+    uint256 public gasAmountPerNode;
 
     mapping(address => mapping(address => uint256)) public commission;
     mapping(address => Asset) public assetInfos;
@@ -60,12 +59,6 @@ contract Dgrid is
         address[] assets,
         uint256[] amounts
     );
-    event Locked(
-        address token,
-        uint256 lockAmount,
-        uint256 nodeCount,
-        address payer
-    );
     event Pause(address operator, bool paused);
     event Unpause(address operator, bool unpaused);
     event EmergencyWithdraw(address to, address token, uint256 amount);
@@ -92,8 +85,7 @@ contract Dgrid is
         uint256 _commissionRate,
         address[] memory _assets,
         uint256 _nodePrice,
-        address _dgridLock,
-        uint256 _lockAmountPerNode
+        uint256 _gasAmountPerNode
     ) public initializer {
         __Ownable_init(_owner);
         __ReentrancyGuard_init();
@@ -112,8 +104,7 @@ contract Dgrid is
         }
         dgridNode = IDgridNode(_dgridNodeProxy);
         _initNodeNodeId();
-        lockAmountPerNode = _lockAmountPerNode;
-        dgridLock = _dgridLock;
+        gasAmountPerNode = _gasAmountPerNode;
     }
 
     function buyNode(
@@ -151,10 +142,9 @@ contract Dgrid is
         address signer = ECDSA.recover(ethSignedMessageHash, signature);
         // check if the signer is the authorized server address
         require(signer == server, "Invalid Signature");
-        require(dgridLock != address(0), "dgridLock not set");
         fulfilledOrders[orderId] = true;
         uint256 paymentAmount = calculatePaymentAmount(nodeCount);
-        uint256 lockAmount = calculateLockAmount(nodeCount);
+        uint256 gasAmount = calculateGasAmount(nodeCount);
         uint256 payValue = 0;
         uint256 commissionAmount;
         if (asset == address(0)) {
@@ -162,78 +152,59 @@ contract Dgrid is
             uint256 bnbPrice = priceFeed.fetchPrice(address(0));
             require(bnbPrice > 0, "Invalid bnb price");
             uint256 paymentAmountInBnb = (paymentAmount * 1e18) / bnbPrice;
-            uint256 lockAmountInBnb = (lockAmount * 1e18) / bnbPrice;
+            uint256 gasAmountInBnb = (gasAmount * 1e18) / bnbPrice;
+            uint256 totalAmountInBnb = paymentAmountInBnb + gasAmountInBnb;
             require(
-                msg.value >= paymentAmountInBnb,
+                msg.value >= totalAmountInBnb,
                 "Buy Node: Insufficient payment amount"
             );
-            payValue = paymentAmountInBnb;
+            payValue = totalAmountInBnb;
             if (parent != address(0)) {
                 commissionAmount = (paymentAmountInBnb * commissionRate) / 100;
                 commission[parent][asset] += commissionAmount;
             }
-            // check if the payment amount is enough
-            require(
-                paymentAmountInBnb >= commissionAmount + lockAmountInBnb,
-                "lock+commission exceeds payment"
-            );
 
-            //transfer bnb to dgrid lock
-            _safeTransfer(address(0), dgridLock, lockAmountInBnb);
-            _safeTransfer(
-                address(0),
-                dev,
-                paymentAmountInBnb - commissionAmount - lockAmountInBnb
-            ); //transfer bnb to dev
+            //transfer bnb to dev
+            _safeTransfer(address(0), dev, totalAmountInBnb - commissionAmount); //transfer bnb to dev
 
-            if (msg.value > paymentAmountInBnb) {
+            if (msg.value > totalAmountInBnb) {
                 _safeTransfer(
                     address(0),
                     msg.sender,
-                    msg.value - paymentAmountInBnb
+                    msg.value - totalAmountInBnb
                 ); //refund bnb to user
             }
-            emit Locked(address(0), lockAmountInBnb, nodeCount, msg.sender);
         } else {
             // pay with erc20 asset
             uint256 paymentAmountInAsset = (paymentAmount *
                 (10 ** assetInfos[asset].decimals)) / 1e18;
-            uint256 lockAmountInAsset = (lockAmount *
+            uint256 gasAmountInAsset = (gasAmount *
                 (10 ** assetInfos[asset].decimals)) / 1e18;
+            uint256 totalAmountInAsset = paymentAmountInAsset +
+                gasAmountInAsset;
             uint256 allowance = ERC20(asset).allowance(
                 msg.sender,
                 address(this)
             );
             require(
-                allowance >= paymentAmountInAsset,
+                allowance >= totalAmountInAsset,
                 "Buy Node: Insufficient allowance"
             );
-            payValue = paymentAmountInAsset;
+            payValue = totalAmountInAsset;
             if (parent != address(0)) {
                 commissionAmount =
                     (paymentAmountInAsset * commissionRate) /
                     100;
                 commission[parent][asset] += commissionAmount;
             }
-            // check if the payment amount is enough
-            require(
-                paymentAmountInAsset >= commissionAmount + lockAmountInAsset,
-                "lock+commission exceeds payment"
-            );
             _safeTransferFrom(
                 asset,
                 msg.sender,
                 address(this),
-                paymentAmountInAsset
+                totalAmountInAsset
             );
-            //transfer asset to dgrid lock
-            _safeTransfer(asset, dgridLock, lockAmountInAsset);
-            _safeTransfer(
-                asset,
-                dev,
-                paymentAmountInAsset - commissionAmount - lockAmountInAsset
-            );
-            emit Locked(asset, lockAmountInAsset, nodeCount, msg.sender);
+            //transfer asset to dev
+            _safeTransfer(asset, dev, totalAmountInAsset - commissionAmount);
         }
 
         uint256[] memory nodeIds = new uint256[](nodeCount);
@@ -305,11 +276,11 @@ contract Dgrid is
         return nodePrice * nodeCount * 1e18;
     }
 
-    function calculateLockAmount(
+    function calculateGasAmount(
         uint256 nodeCount
     ) public view returns (uint256) {
-        require(lockAmountPerNode > 0, "Lock amount not set");
-        return lockAmountPerNode * nodeCount * 1e18;
+        require(gasAmountPerNode > 0, "Gas amount not set");
+        return gasAmountPerNode * nodeCount * 1e18;
     }
 
     function _safeTransfer(address token, address to, uint256 value) internal {
@@ -363,13 +334,8 @@ contract Dgrid is
         nodePrice = _nodePrice;
     }
 
-    function setLockAmountPerNode(uint256 _lockAmountPerNode) public onlyOwner {
-        lockAmountPerNode = _lockAmountPerNode;
-    }
-
-    function setDgridLock(address _dgridLock) public onlyOwner {
-        require(_dgridLock != address(0), "Invalid dgrid lock address");
-        dgridLock = _dgridLock;
+    function setGasAmountPerNode(uint256 _gasAmountPerNode) public onlyOwner {
+        gasAmountPerNode = _gasAmountPerNode;
     }
 
     function pause() external onlyOwner whenNotPaused {
