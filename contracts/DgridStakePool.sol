@@ -6,7 +6,9 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {
+    MessageHashUtils
+} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import "./Interfaces/IDgridNode.sol";
@@ -56,6 +58,13 @@ contract DgridStakePool is
     mapping(address => UserInfo) public userInfo; //user -> info
     // mapping(address => uint256[]) public unpaidRewards; //unpaid rewards: user -> [rewardIndex => amount]
 
+    //unstake
+    bool public unstakeEnabled;
+
+    //signature action usage
+    bytes32 private constant ACTION_DEPOSIT = keccak256("DEPOSIT");
+    bytes32 private constant ACTION_UNJAIL = keccak256("UNJAIL");
+
     event Deposit(address indexed user, uint256[] tokenIds);
     event JailNodes(address indexed user, uint256[] tokenIds);
     event UnjailNodes(address indexed user, uint256[] tokenIds);
@@ -80,6 +89,13 @@ contract DgridStakePool is
     event Pause(address operator, bool paused);
     event Unpause(address operator, bool paused);
     event EmergencyWithdraw(address to, address token, uint256 amount);
+    event UpdateUnstakeEnabled(bool unstakeEnabled);
+    event Unstake(address indexed user, uint256 amount);
+
+    modifier whenUnstakeEnabled() {
+        require(unstakeEnabled, "unstake is not enabled");
+        _;
+    }
 
     modifier onlyServer() {
         require(msg.sender == server, "only server can call this function");
@@ -108,17 +124,21 @@ contract DgridStakePool is
         address[] memory _rewardTokens,
         uint256[] memory _rewardPerBlocks
     ) external initializer {
+        //check params
+        require(_owner != address(0), "owner is zero address");
+        require(_server != address(0), "server is zero address");
+        require(_dgridNode != address(0), "dgrid node is zero address");
+        require(_rewardTokens.length > 0, "reward tokens is empty");
+        require(
+            _rewardTokens.length == _rewardPerBlocks.length,
+            "length mismatch"
+        );
         __Ownable_init(_owner);
         __ReentrancyGuard_init();
         server = _server;
         startBlock = _startBlock;
         lastRewardBlock = _startBlock;
         dgridNode = IDgridNode(_dgridNode);
-        require(_rewardTokens.length > 0, "reward tokens is empty");
-        require(
-            _rewardTokens.length == _rewardPerBlocks.length,
-            "length mismatch"
-        );
         for (uint256 i = 0; i < _rewardTokens.length; i++) {
             require(
                 _rewardTokens[i] != address(0),
@@ -228,6 +248,7 @@ contract DgridStakePool is
         uint256 _expireTime,
         bytes calldata _signature
     ) external nonReentrant whenNotPaused {
+        require(_staker != address(0), "staker is zero address");
         require(_nodes.length > 0, "nodes is empty");
         for (uint256 i = 0; i < _nodes.length; i++) {
             require(
@@ -241,7 +262,13 @@ contract DgridStakePool is
 
         // server sign check
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
-            abi.encode(block.chainid, _nodes, _staker, _expireTime)
+            abi.encode(
+                block.chainid,
+                _nodes,
+                _staker,
+                _expireTime,
+                ACTION_DEPOSIT
+            )
         );
         address signer = ECDSA.recover(ethSignedMessageHash, _signature);
         require(signer == server, "invalid signature");
@@ -256,6 +283,27 @@ contract DgridStakePool is
         totalStaked += _nodes.length;
         _resetDebt(_staker);
         emit Deposit(_staker, _nodes);
+    }
+
+    function unstake(
+        uint256[] memory _nodeIds
+    ) external nonReentrant whenUnstakeEnabled whenNotPaused {
+        require(block.number >= startBlock, "not started");
+        for (uint256 i = 0; i < _nodeIds.length; i++) {
+            require(dgridNode.ownerOf(_nodeIds[i]) == msg.sender, "not owner");
+            require(!dgridNode.isJailed(_nodeIds[i]), "node is already jailed");
+            require(dgridNode.isStaked(_nodeIds[i]), "node is not staked");
+        }
+        updatePool();
+        _ensureUserInfoLen(msg.sender);
+        _accrueUnpaid(msg.sender);
+        UserInfo storage user = userInfo[msg.sender];
+        require(user.amount >= _nodeIds.length, "not enough staked");
+        user.amount -= _nodeIds.length;
+        totalStaked -= _nodeIds.length;
+        _resetDebt(msg.sender);
+        dgridNode.unstake(_nodeIds);
+        emit Unstake(msg.sender, _nodeIds.length);
     }
 
     //server: jail nodes
@@ -293,9 +341,27 @@ contract DgridStakePool is
     //user: unjail nodes
     function unjailNodes(
         uint256[] memory _nodeIds,
-        address _owner
+        address _owner,
+        uint256 _expireTime,
+        bytes calldata _signature
     ) external nonReentrant whenNotPaused {
+        require(_owner != address(0), "owner is zero address");
         require(_nodeIds.length > 0, "node ids is empty");
+        require(_expireTime > block.timestamp, "expire time is in the past");
+
+        // server sign check
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
+            abi.encode(
+                block.chainid,
+                _nodeIds,
+                _owner,
+                _expireTime,
+                ACTION_UNJAIL
+            )
+        );
+        address signer = ECDSA.recover(ethSignedMessageHash, _signature);
+        require(signer == server, "invalid signature");
+
         updatePool(); //first update pool
         _ensureUserInfoLen(_owner);
         for (uint256 i = 0; i < _nodeIds.length; i++) {
@@ -332,6 +398,7 @@ contract DgridStakePool is
         );
         updatePool();
         for (uint256 i = 0; i < _rewardPerBlock.length; i++) {
+            require(_rewardPerBlock[i] > 0, "reward per block is zero");
             emit UpdateRewardPerBlock(
                 address(rewardTokenInfos[i].rewardToken),
                 rewardTokenInfos[i].rewardPerBlock,
@@ -352,6 +419,7 @@ contract DgridStakePool is
 
     //admin: set server address
     function setServer(address _server) external onlyOwner {
+        require(_server != address(0), "server is zero address");
         address oldServer = server;
         server = _server;
         emit UpdateServer(oldServer, _server);
@@ -478,5 +546,10 @@ contract DgridStakePool is
 
     function accPerSharesLength() external view returns (uint256) {
         return accPerShares.length;
+    }
+
+    function setUnstakeEnabled(bool _unstakeEnabled) external onlyOwner {
+        unstakeEnabled = _unstakeEnabled;
+        emit UpdateUnstakeEnabled(unstakeEnabled);
     }
 }

@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
-import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {
+    MessageHashUtils
+} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {ChainlinkPriceFeed} from "./ChainlinkPriceFeed.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {
+    SafeERC20
+} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {
+    OwnableUpgradeable
+} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {
+    Initializable
+} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {
+    ReentrancyGuardUpgradeable
+} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {IDgridNode} from "./Interfaces/IDgridNode.sol";
 
 contract Dgrid is
@@ -62,6 +72,12 @@ contract Dgrid is
     event Pause(address operator, bool paused);
     event Unpause(address operator, bool unpaused);
     event EmergencyWithdraw(address to, address token, uint256 amount);
+    event SetServer(address server);
+    event SetDev(address dev);
+    event SetPriceFeed(address priceFeed);
+    event SetAssets(address[] assets);
+    event SetNodePrice(uint256 nodePrice);
+    event SetGasAmountPerNode(uint256 gasAmountPerNode);
 
     modifier whenNotPaused() {
         require(!paused, "paused");
@@ -87,6 +103,18 @@ contract Dgrid is
         uint256 _nodePrice,
         uint256 _gasAmountPerNode
     ) public initializer {
+        //check params
+        require(_owner != address(0), "owner is zero address");
+        require(_server != address(0), "server is zero address");
+        require(_dev != address(0), "dev is zero address");
+        require(_priceFeed != address(0), "price feed is zero address");
+        require(
+            _dgridNodeProxy != address(0),
+            "dgrid node proxy is zero address"
+        );
+        require(_nodePrice > 0, "node price is zero");
+        require(_gasAmountPerNode > 0, "gas amount per node is zero");
+
         __Ownable_init(_owner);
         __ReentrancyGuard_init();
         server = _server;
@@ -95,6 +123,7 @@ contract Dgrid is
         commissionRate = _commissionRate;
         nodePrice = _nodePrice;
         for (uint256 i = 0; i < _assets.length; i++) {
+            require(_assets[i] != address(0), "asset is zero address");
             ERC20 token = ERC20(_assets[i]);
             assetInfos[_assets[i]] = Asset({
                 token: address(token),
@@ -117,15 +146,13 @@ contract Dgrid is
         address asset
     ) public payable nonReentrant whenNotPaused {
         require(!fulfilledOrders[orderId], "Order already fulfilled");
-        require(
-            asset == address(0) || assetInfos[asset].token != address(0),
-            "Invalid asset"
-        );
+        require(assetInfos[asset].token != address(0), "Invalid asset");
         require(
             expireTime > block.timestamp,
             "ExpirationTime must be greater than current timestamp"
         );
         require(nodeCount > 0, "invalid nodeCount");
+        require(msg.value == 0, "Invalid msg.value"); //only accept asset
 
         // get the eth signed message hash
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
@@ -147,65 +174,26 @@ contract Dgrid is
         uint256 gasAmount = calculateGasAmount(nodeCount);
         uint256 payValue = 0;
         uint256 commissionAmount;
-        if (asset == address(0)) {
-            // pay with bnb
-            uint256 bnbPrice = priceFeed.fetchPrice(address(0));
-            require(bnbPrice > 0, "Invalid bnb price");
-            uint256 paymentAmountInBnb = (paymentAmount * 1e18) / bnbPrice;
-            uint256 gasAmountInBnb = (gasAmount * 1e18) / bnbPrice;
-            uint256 totalAmountInBnb = paymentAmountInBnb + gasAmountInBnb;
-            require(
-                msg.value >= totalAmountInBnb,
-                "Buy Node: Insufficient payment amount"
-            );
-            payValue = totalAmountInBnb;
-            if (parent != address(0)) {
-                commissionAmount = (paymentAmountInBnb * commissionRate) / 100;
-                commission[parent][asset] += commissionAmount;
-            }
 
-            //transfer bnb to dev
-            _safeTransfer(address(0), dev, totalAmountInBnb - commissionAmount); //transfer bnb to dev
-
-            if (msg.value > totalAmountInBnb) {
-                _safeTransfer(
-                    address(0),
-                    msg.sender,
-                    msg.value - totalAmountInBnb
-                ); //refund bnb to user
-            }
-        } else {
-            // pay with erc20 asset
-            uint256 paymentAmountInAsset = (paymentAmount *
-                (10 ** assetInfos[asset].decimals)) / 1e18;
-            uint256 gasAmountInAsset = (gasAmount *
-                (10 ** assetInfos[asset].decimals)) / 1e18;
-            uint256 totalAmountInAsset = paymentAmountInAsset +
-                gasAmountInAsset;
-            uint256 allowance = ERC20(asset).allowance(
-                msg.sender,
-                address(this)
-            );
-            require(
-                allowance >= totalAmountInAsset,
-                "Buy Node: Insufficient allowance"
-            );
-            payValue = totalAmountInAsset;
-            if (parent != address(0)) {
-                commissionAmount =
-                    (paymentAmountInAsset * commissionRate) /
-                    100;
-                commission[parent][asset] += commissionAmount;
-            }
-            _safeTransferFrom(
-                asset,
-                msg.sender,
-                address(this),
-                totalAmountInAsset
-            );
-            //transfer asset to dev
-            _safeTransfer(asset, dev, totalAmountInAsset - commissionAmount);
+        // pay with erc20 asset
+        uint256 paymentAmountInAsset = (paymentAmount *
+            (10 ** assetInfos[asset].decimals)) / 1e18;
+        uint256 gasAmountInAsset = (gasAmount *
+            (10 ** assetInfos[asset].decimals)) / 1e18;
+        uint256 totalAmountInAsset = paymentAmountInAsset + gasAmountInAsset;
+        uint256 allowance = ERC20(asset).allowance(msg.sender, address(this));
+        require(
+            allowance >= totalAmountInAsset,
+            "Buy Node: Insufficient allowance"
+        );
+        payValue = totalAmountInAsset;
+        if (parent != address(0)) {
+            commissionAmount = (paymentAmountInAsset * commissionRate) / 100;
+            commission[parent][asset] += commissionAmount;
         }
+        _safeTransferFrom(asset, msg.sender, address(this), totalAmountInAsset);
+        //transfer asset to dev
+        _safeTransfer(asset, dev, totalAmountInAsset - commissionAmount);
 
         uint256[] memory nodeIds = new uint256[](nodeCount);
         for (uint256 i = 0; i < nodeCount; i++) {
@@ -236,6 +224,8 @@ contract Dgrid is
         whenNotPaused
         returns (address[] memory assets, uint256[] memory amounts)
     {
+        require(_user != address(0), "Invalid user");
+        require(_assets.length > 0, "Invalid assets");
         assets = new address[](_assets.length);
         amounts = new uint256[](_assets.length);
         for (uint256 i = 0; i < _assets.length; i++) {
@@ -310,32 +300,54 @@ contract Dgrid is
     }
 
     function setServer(address _server) public onlyOwner {
+        require(_server != address(0), "Invalid server");
         server = _server;
+        emit SetServer(_server);
     }
 
     function setDev(address _dev) public onlyOwner {
+        require(_dev != address(0), "Invalid dev");
         dev = _dev;
+        emit SetDev(_dev);
     }
 
     function setPriceFeed(address _priceFeed) public onlyOwner {
+        require(_priceFeed != address(0), "Invalid price feed");
         priceFeed = ChainlinkPriceFeed(_priceFeed);
+        emit SetPriceFeed(_priceFeed);
     }
 
     function setAssets(address[] memory _assets) public onlyOwner {
         for (uint256 i = 0; i < _assets.length; i++) {
+            require(_assets[i] != address(0), "Invalid asset");
             assetInfos[_assets[i]] = Asset({
                 token: _assets[i],
                 decimals: ERC20(_assets[i]).decimals()
             });
+
+            // remove duplicate assets
+            bool exists = false;
+            for (uint256 j = 0; j < assetList.length; j++) {
+                if (assetList[j] == _assets[i]) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) assetList.push(_assets[i]);
         }
+        emit SetAssets(_assets);
     }
 
     function setNodePrice(uint256 _nodePrice) public onlyOwner {
+        require(_nodePrice > 0, "Invalid node price");
         nodePrice = _nodePrice;
+        emit SetNodePrice(_nodePrice);
     }
 
     function setGasAmountPerNode(uint256 _gasAmountPerNode) public onlyOwner {
+        require(_gasAmountPerNode > 0, "Invalid gas amount per node");
         gasAmountPerNode = _gasAmountPerNode;
+        emit SetGasAmountPerNode(_gasAmountPerNode);
     }
 
     function pause() external onlyOwner whenNotPaused {

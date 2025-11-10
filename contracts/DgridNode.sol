@@ -18,6 +18,9 @@ contract DgridNode is Initializable, ERC721Upgradeable, OwnableUpgradeable {
     event Unstake(uint256[] tokenIds);
     event Jail(uint256[] tokenIds);
     event Unjail(uint256[] tokenIds);
+    event SetDgridStakePool(address pool);
+    event SetDgrid(address dgrid);
+    event SetPublicTransferEnabled(bool enabled);
 
     modifier onlyDgridStakePool() {
         require(
@@ -41,6 +44,11 @@ contract DgridNode is Initializable, ERC721Upgradeable, OwnableUpgradeable {
         address _dgrid,
         address _dgridStakePool
     ) public initializer {
+        //check params
+        require(owner != address(0), "Invalid owner");
+        require(_dgrid != address(0), "Invalid dgrid");
+        require(_dgridStakePool != address(0), "Invalid dgrid stake pool");
+
         __ERC721_init("Dgrid Node", "DGN");
         __Ownable_init(owner);
         publicTransferEnabled = false;
@@ -50,6 +58,7 @@ contract DgridNode is Initializable, ERC721Upgradeable, OwnableUpgradeable {
 
     // only owner can mint
     function mint(address to, uint256 id) external onlyDgrid {
+        require(to != address(0), "Invalid to");
         _mint(to, id);
         emit Mint(to, id);
     }
@@ -118,14 +127,19 @@ contract DgridNode is Initializable, ERC721Upgradeable, OwnableUpgradeable {
     }
 
     function setDgridStakePool(address _pool) external onlyOwner {
+        require(_pool != address(0), "Invalid pool");
         dgridStakePool = _pool;
+        emit SetDgridStakePool(_pool);
     }
 
     function setDgrid(address _dgrid) external onlyOwner {
+        require(_dgrid != address(0), "Invalid dgrid");
         dgrid = _dgrid;
+        emit SetDgrid(_dgrid);
     }
 
     function setPublicTransferEnabled(bool enabled) external onlyOwner {
         publicTransferEnabled = enabled;
+        emit SetPublicTransferEnabled(enabled);
     }
 }
