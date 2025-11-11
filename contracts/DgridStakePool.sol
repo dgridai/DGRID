@@ -180,6 +180,12 @@ contract DgridStakePool is
             return;
         }
 
+        if (paused) {
+            // freeze rewards
+            lastRewardBlock = block.number;
+            return;
+        }
+
         if (totalStaked == 0 || rewardTokenInfos.length == 0) {
             lastRewardBlock = block.number;
             return;
@@ -516,11 +522,13 @@ contract DgridStakePool is
     }
 
     function pause() external onlyOwner whenNotPaused {
+        updatePool(); //first update accPerShares
         paused = true;
         emit Pause(msg.sender, true);
     }
 
     function unpause() external onlyOwner whenPaused {
+        updatePool(); //first update accPerShares
         paused = false;
         emit Unpause(msg.sender, false);
     }

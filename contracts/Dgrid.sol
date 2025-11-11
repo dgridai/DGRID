@@ -144,7 +144,7 @@ contract Dgrid is
         uint256 expireTime,
         bytes calldata signature,
         address asset
-    ) public payable nonReentrant whenNotPaused {
+    ) public nonReentrant whenNotPaused {
         require(!fulfilledOrders[orderId], "Order already fulfilled");
         require(assetInfos[asset].token != address(0), "Invalid asset");
         require(
@@ -152,7 +152,6 @@ contract Dgrid is
             "ExpirationTime must be greater than current timestamp"
         );
         require(nodeCount > 0, "invalid nodeCount");
-        require(msg.value == 0, "Invalid msg.value"); //only accept asset
 
         // get the eth signed message hash
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
