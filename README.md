@@ -2,7 +2,7 @@
 
 ### Overview
 
-DGRID is an upgradeable on-chain commerce module for selling ERC-721 “nodes” with:
+A decentralized smart AI network built on BNB Smart Chain (BSC) and compatible with other EVM networks.
 
 - Multi-asset payment (native token or ERC-20) via Chainlink price conversion
 - Automated referral commissions

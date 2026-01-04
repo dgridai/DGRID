@@ -38,6 +38,12 @@ contract DgridStakePool is
         uint256[] tokenIds;
     }
 
+    struct FixedRewardTokenInfo {
+        ERC20 rewardToken; //reward token
+        uint256 rewardPerNodePerBlock; //reward per node per block
+        uint256 finalRewardBlock; //final reward block. after this block, the reward will be 0.
+    }
+
     // paused
     bool public paused;
 
@@ -60,6 +66,15 @@ contract DgridStakePool is
 
     //unstake
     bool public unstakeEnabled;
+
+    //fixed reward token
+    FixedRewardTokenInfo[] public fixedRewardTokenInfos; //fixed reward token infos
+    mapping(address => uint256) public fixedLatestRewardBlock; //user address -> latest reward block
+    mapping(address => uint256[]) public fixedUnpaidRewards; //user address -> unpaid rewards
+    mapping(address => uint256[]) public fixedPaidRewards; //user address -> paid rewards
+
+    //tdgai token address
+    address public tdgaiToken;
 
     //signature action usage
     bytes32 private constant ACTION_DEPOSIT = keccak256("DEPOSIT");
@@ -91,6 +106,11 @@ contract DgridStakePool is
     event EmergencyWithdraw(address to, address token, uint256 amount);
     event UpdateUnstakeEnabled(bool unstakeEnabled);
     event Unstake(address indexed user, uint256 amount);
+    event UpdateFixedRewardPerBlock(
+        address rewardToken,
+        uint256 oldValue,
+        uint256 newValue
+    );
 
     modifier whenUnstakeEnabled() {
         require(unstakeEnabled, "unstake is not enabled");
@@ -156,6 +176,11 @@ contract DgridStakePool is
         }
     }
 
+    function initializeV2(address _tdgaiToken) external reinitializer(2) {
+        require(_tdgaiToken != address(0), "tdgai token is zero address");
+        tdgaiToken = _tdgaiToken;
+    }
+
     //add reward token
     function addRewardToken(
         address _rewardToken,
@@ -163,6 +188,11 @@ contract DgridStakePool is
     ) public onlyOwner {
         require(_rewardToken != address(0), "reward token is zero address");
         require(_rewardPerBlock > 0, "reward per block is zero");
+        for (uint256 i = 0; i < rewardTokenInfos.length; i++) {
+            if (address(rewardTokenInfos[i].rewardToken) == _rewardToken) {
+                revert("reward token already exists");
+            }
+        }
         updatePool();
         rewardTokenInfos.push(
             RewardTokenInfo({
@@ -211,20 +241,36 @@ contract DgridStakePool is
         returns (
             address[] memory rewardTokens,
             uint256[] memory pendingRewards,
-            uint256[] memory paidRewards
+            uint256[] memory paidRewards,
+            address[] memory fixedRewardTokens,
+            uint256[] memory fixedPendingRewards,
+            uint256[] memory fixedTokenPaidRewards
         )
     {
         uint256 n = rewardTokenInfos.length;
         rewardTokens = new address[](n);
         pendingRewards = new uint256[](n);
         paidRewards = new uint256[](n);
+        uint256 m = fixedRewardTokenInfos.length;
+        fixedRewardTokens = new address[](m);
+        fixedPendingRewards = new uint256[](m);
+        fixedTokenPaidRewards = new uint256[](m);
 
-        if (n == 0) {
-            return (rewardTokens, pendingRewards, paidRewards);
+        if (n == 0 && m == 0) {
+            return (
+                rewardTokens,
+                pendingRewards,
+                paidRewards,
+                fixedRewardTokens,
+                fixedPendingRewards,
+                fixedTokenPaidRewards
+            );
         }
 
         UserInfo storage user = userInfo[_user];
-        uint256 blocks = block.number > lastRewardBlock && totalStaked > 0
+        uint256 blocks = !paused &&
+            block.number > lastRewardBlock &&
+            totalStaked > 0
             ? (block.number - lastRewardBlock)
             : 0;
 
@@ -244,7 +290,21 @@ contract DgridStakePool is
                 : 0;
             rewardTokens[i] = address(rewardTokenInfos[i].rewardToken);
         }
-        return (rewardTokens, pendingRewards, paidRewards);
+
+        (
+            fixedRewardTokens,
+            fixedPendingRewards,
+            fixedTokenPaidRewards
+        ) = pendingFixedReward(_user);
+
+        return (
+            rewardTokens,
+            pendingRewards,
+            paidRewards,
+            fixedRewardTokens,
+            fixedPendingRewards,
+            fixedTokenPaidRewards
+        );
     }
 
     //stake/add
@@ -283,11 +343,14 @@ contract DgridStakePool is
 
         updatePool();
         _ensureUserInfoLen(_staker);
+        _ensureUserFixedRewardsInfoLen(_staker);
         _accrueUnpaid(_staker);
+        _accrueFixedUnpaid(_staker);
         UserInfo storage user = userInfo[_staker];
         user.amount += _nodes.length;
         totalStaked += _nodes.length;
         _resetDebt(_staker);
+        _resetUserFixedLatestRewardBlock(_staker);
         emit Deposit(_staker, _nodes);
     }
 
@@ -302,12 +365,15 @@ contract DgridStakePool is
         }
         updatePool();
         _ensureUserInfoLen(msg.sender);
+        _ensureUserFixedRewardsInfoLen(msg.sender);
         _accrueUnpaid(msg.sender);
+        _accrueFixedUnpaid(msg.sender);
         UserInfo storage user = userInfo[msg.sender];
         require(user.amount >= _nodeIds.length, "not enough staked");
         user.amount -= _nodeIds.length;
         totalStaked -= _nodeIds.length;
         _resetDebt(msg.sender);
+        _resetUserFixedLatestRewardBlock(msg.sender);
         dgridNode.unstake(_nodeIds);
         emit Unstake(msg.sender, _nodeIds.length);
     }
@@ -334,12 +400,18 @@ contract DgridStakePool is
 
             dgridNode.jail(jailInfo.tokenIds); //batch lock
             UserInfo storage user = userInfo[jailInfo.owner];
-            require(user.amount > 0, "user is not staked");
+            require(
+                user.amount >= jailInfo.tokenIds.length,
+                "not enough staked"
+            );
             _ensureUserInfoLen(jailInfo.owner);
+            _ensureUserFixedRewardsInfoLen(jailInfo.owner);
             _accrueUnpaid(jailInfo.owner);
+            _accrueFixedUnpaid(jailInfo.owner);
             user.amount -= jailInfo.tokenIds.length;
             totalStaked -= jailInfo.tokenIds.length;
             _resetDebt(jailInfo.owner);
+            _resetUserFixedLatestRewardBlock(jailInfo.owner);
             emit JailNodes(jailInfo.owner, jailInfo.tokenIds);
         }
     }
@@ -370,6 +442,7 @@ contract DgridStakePool is
 
         updatePool(); //first update pool
         _ensureUserInfoLen(_owner);
+        _ensureUserFixedRewardsInfoLen(_owner);
         for (uint256 i = 0; i < _nodeIds.length; i++) {
             uint256 nodeId = _nodeIds[i];
             address owner = dgridNode.ownerOf(nodeId);
@@ -377,11 +450,13 @@ contract DgridStakePool is
             require(dgridNode.isJailed(nodeId), "node is not jailed");
         }
         _accrueUnpaid(_owner);
+        _accrueFixedUnpaid(_owner);
         dgridNode.unjail(_nodeIds);
         UserInfo storage user = userInfo[_owner];
         user.amount += _nodeIds.length;
         totalStaked += _nodeIds.length;
         _resetDebt(_owner);
+        _resetUserFixedLatestRewardBlock(_owner);
         emit UnjailNodes(_owner, _nodeIds);
     }
 
@@ -390,8 +465,12 @@ contract DgridStakePool is
         require(block.number >= startBlock, "not started");
         updatePool();
         _ensureUserInfoLen(msg.sender);
-        _payReward(msg.sender);
+        _ensureUserFixedRewardsInfoLen(msg.sender);
+        _accrueUnpaid(msg.sender); //first : accrue unpaid rewards
+        _payReward(msg.sender); //second : pay unpaid rewards(without tdgai)
+        _payFixedReward(msg.sender);
         _resetDebt(msg.sender);
+        _resetUserFixedLatestRewardBlock(msg.sender);
     }
 
     //admin: adjust reward per block
@@ -431,6 +510,24 @@ contract DgridStakePool is
         emit UpdateServer(oldServer, _server);
     }
 
+    //admin: adjust reward per block
+    function setRewardPerBlockByIndex(
+        uint256 _rewardTokenIndex,
+        uint256 _rewardPerBlock
+    ) external onlyOwner {
+        require(
+            _rewardTokenIndex < rewardTokenInfos.length,
+            "index out of range"
+        );
+        require(_rewardPerBlock > 0, "reward per block is zero");
+        emit UpdateRewardPerBlock(
+            address(rewardTokenInfos[_rewardTokenIndex].rewardToken),
+            rewardTokenInfos[_rewardTokenIndex].rewardPerBlock,
+            _rewardPerBlock
+        );
+        rewardTokenInfos[_rewardTokenIndex].rewardPerBlock = _rewardPerBlock;
+    }
+
     function _accrueUnpaid(address _user) internal {
         UserInfo storage user = userInfo[_user];
         if (user.amount == 0) {
@@ -450,11 +547,10 @@ contract DgridStakePool is
     function _payReward(address _user) internal {
         UserInfo storage user = userInfo[_user];
         for (uint256 i = 0; i < rewardTokenInfos.length; i++) {
-            uint256 pending = (user.amount * accPerShares[i]) /
-                ACC_PRECISION -
-                user.rewardDebt[i];
-            uint256 unpaid = user.unpaidRewards[i];
-            uint256 toPay = pending + unpaid;
+            if (address(rewardTokenInfos[i].rewardToken) == tdgaiToken) {
+                continue; //skip tdgai reward token
+            }
+            uint256 toPay = user.unpaidRewards[i];
             if (toPay > 0) {
                 user.unpaidRewards[i] = 0;
                 user.paidRewards[i] += toPay;
@@ -550,6 +646,20 @@ contract DgridStakePool is
                 );
             }
         }
+
+        for (uint256 i = 0; i < fixedRewardTokenInfos.length; i++) {
+            uint256 balance = fixedRewardTokenInfos[i].rewardToken.balanceOf(
+                address(this)
+            );
+            if (balance > 0) {
+                fixedRewardTokenInfos[i].rewardToken.safeTransfer(to, balance);
+                emit EmergencyWithdraw(
+                    to,
+                    address(fixedRewardTokenInfos[i].rewardToken),
+                    balance
+                );
+            }
+        }
     }
 
     function accPerSharesLength() external view returns (uint256) {
@@ -559,5 +669,249 @@ contract DgridStakePool is
     function setUnstakeEnabled(bool _unstakeEnabled) external onlyOwner {
         unstakeEnabled = _unstakeEnabled;
         emit UpdateUnstakeEnabled(unstakeEnabled);
+    }
+
+    function getUserAmount(address _user) external view returns (uint256) {
+        return userInfo[_user].amount;
+    }
+
+    function getUserUnpaidRewards(
+        address _user
+    ) external view returns (uint256[] memory) {
+        return userInfo[_user].unpaidRewards;
+    }
+
+    function setTdgaiToken(address _tdgaiToken) external onlyOwner {
+        require(_tdgaiToken != address(0), "tdgai token is zero address");
+        tdgaiToken = _tdgaiToken;
+    }
+
+    //about fixed reward token
+    function addFixedRewardToken(
+        address _rewardToken,
+        uint256 _rewardPerNodePerBlock
+    ) external onlyOwner {
+        require(_rewardToken != address(0), "reward token is zero address");
+        require(
+            _rewardPerNodePerBlock > 0,
+            "reward per node per block is zero"
+        );
+        fixedRewardTokenInfos.push(
+            FixedRewardTokenInfo({
+                rewardToken: ERC20(_rewardToken),
+                rewardPerNodePerBlock: _rewardPerNodePerBlock,
+                finalRewardBlock: 0
+            })
+        );
+    }
+
+    //pending fixed reward
+    function pendingFixedReward(
+        address _user
+    )
+        public
+        view
+        returns (
+            address[] memory rewardTokens,
+            uint256[] memory rewards,
+            uint256[] memory paidRewards
+        )
+    {
+        uint256 n = fixedRewardTokenInfos.length;
+        rewardTokens = new address[](n);
+        rewards = new uint256[](n);
+        paidRewards = new uint256[](n);
+
+        if (n == 0) {
+            return (rewardTokens, rewards, paidRewards);
+        }
+
+        if (block.number < startBlock) {
+            for (uint256 i = 0; i < n; i++) {
+                rewards[i] = 0;
+                rewardTokens[i] = address(fixedRewardTokenInfos[i].rewardToken);
+                paidRewards[i] = 0;
+            }
+            return (rewardTokens, rewards, paidRewards);
+        }
+
+        UserInfo storage user = userInfo[_user];
+
+        uint256 latestRewardBlock = fixedLatestRewardBlock[_user];
+        if (latestRewardBlock == 0) {
+            latestRewardBlock = startBlock;
+        }
+        for (uint256 i = 0; i < n; i++) {
+            uint256 finalBlock = fixedRewardTokenInfos[i].finalRewardBlock;
+            uint256 rewardBlocks = _calculateFixedRewardBlocks(
+                latestRewardBlock,
+                finalBlock
+            );
+            uint256 unpaid = i < fixedUnpaidRewards[_user].length
+                ? fixedUnpaidRewards[_user][i]
+                : 0;
+
+            rewards[i] =
+                unpaid +
+                rewardBlocks *
+                fixedRewardTokenInfos[i].rewardPerNodePerBlock *
+                user.amount;
+            rewardTokens[i] = address(fixedRewardTokenInfos[i].rewardToken);
+            paidRewards[i] = i < fixedPaidRewards[_user].length
+                ? fixedPaidRewards[_user][i]
+                : 0;
+        }
+        return (rewardTokens, rewards, paidRewards);
+    }
+
+    function _accrueFixedUnpaid(address _user) internal {
+        UserInfo storage user = userInfo[_user];
+        if (user.amount == 0) {
+            return;
+        }
+
+        if (block.number < startBlock) {
+            return;
+        }
+
+        uint256 latestRewardBlock = fixedLatestRewardBlock[_user];
+        if (latestRewardBlock == 0) {
+            latestRewardBlock = startBlock;
+        }
+
+        for (uint256 i = 0; i < fixedRewardTokenInfos.length; i++) {
+            uint256 rewardBlocks = _calculateFixedRewardBlocks(
+                latestRewardBlock,
+                fixedRewardTokenInfos[i].finalRewardBlock
+            );
+            if (rewardBlocks == 0) {
+                continue;
+            }
+            fixedUnpaidRewards[_user][i] +=
+                rewardBlocks *
+                fixedRewardTokenInfos[i].rewardPerNodePerBlock *
+                user.amount;
+        }
+    }
+
+    function _payFixedReward(address _user) internal {
+        (
+            address[] memory rewardTokens,
+            uint256[] memory rewards,
+
+        ) = pendingFixedReward(_user);
+
+        for (uint256 i = 0; i < rewardTokens.length; i++) {
+            uint256 toPay = rewards[i];
+            if (toPay > 0) {
+                fixedUnpaidRewards[_user][i] = 0;
+                fixedPaidRewards[_user][i] += toPay;
+                ERC20(rewardTokens[i]).safeTransfer(_user, toPay);
+                emit Harvest(_user, toPay, address(rewardTokens[i]));
+            }
+        }
+    }
+
+    function _calculateFixedRewardBlocks(
+        uint256 _userLatestRewardBlock,
+        uint256 _finalBlock
+    ) internal view returns (uint256) {
+        if (block.number < startBlock) {
+            return 0;
+        }
+
+        if (_finalBlock == 0 || _finalBlock > block.number) {
+            return block.number - _userLatestRewardBlock;
+        } else {
+            if (_finalBlock <= _userLatestRewardBlock) {
+                //final reward block is reached
+                return 0;
+            } else {
+                //final reward block is not reached
+                return _finalBlock - _userLatestRewardBlock;
+            }
+        }
+    }
+
+    function _resetUserFixedLatestRewardBlock(address _user) internal {
+        if (block.number < startBlock) {
+            return;
+        }
+        fixedLatestRewardBlock[_user] = block.number;
+    }
+
+    function _ensureUserFixedRewardsInfoLen(address _user) internal {
+        if (
+            fixedUnpaidRewards[_user].length == fixedRewardTokenInfos.length &&
+            fixedPaidRewards[_user].length == fixedRewardTokenInfos.length
+        ) {
+            return;
+        }
+        uint256 n = fixedRewardTokenInfos.length;
+        while (fixedUnpaidRewards[_user].length < n) {
+            fixedUnpaidRewards[_user].push(0);
+        }
+        while (fixedPaidRewards[_user].length < n) {
+            fixedPaidRewards[_user].push(0);
+        }
+    }
+
+    function setFixedRewardTokenFinalRewardBlock(
+        uint256 _fixedRewardTokenIndex,
+        uint256 _finalRewardBlock
+    ) external onlyOwner {
+        require(
+            _fixedRewardTokenIndex < fixedRewardTokenInfos.length,
+            "index out of range"
+        );
+        require(
+            _finalRewardBlock > block.number,
+            "final reward block is in the past"
+        );
+        fixedRewardTokenInfos[_fixedRewardTokenIndex]
+            .finalRewardBlock = _finalRewardBlock;
+    }
+
+    //admin: adjust reward per block
+    function setFixedRewardPerBlock(
+        uint256[] memory _rewardFixedPerBlock
+    ) external onlyOwner {
+        require(
+            _rewardFixedPerBlock.length == fixedRewardTokenInfos.length,
+            "length mismatch"
+        );
+        require(block.number < startBlock, "already started");
+        for (uint256 i = 0; i < _rewardFixedPerBlock.length; i++) {
+            require(
+                _rewardFixedPerBlock[i] > 0,
+                "fixed reward per block is zero"
+            );
+            emit UpdateFixedRewardPerBlock(
+                address(fixedRewardTokenInfos[i].rewardToken),
+                fixedRewardTokenInfos[i].rewardPerNodePerBlock,
+                _rewardFixedPerBlock[i]
+            );
+            fixedRewardTokenInfos[i]
+                .rewardPerNodePerBlock = _rewardFixedPerBlock[i];
+        }
+    }
+
+    function endFixedTokenReward(
+        uint256 _fixedRewardTokenIndex
+    ) external onlyOwner {
+        require(
+            _fixedRewardTokenIndex < fixedRewardTokenInfos.length,
+            "index out of range"
+        );
+
+        uint256 oldFinal = fixedRewardTokenInfos[_fixedRewardTokenIndex]
+            .finalRewardBlock;
+        uint256 newFinal = block.number;
+
+        // only allow tightening (oldFinal==0 means not set截止，also allow set)
+        require(oldFinal == 0 || newFinal < oldFinal, "final already earlier");
+
+        fixedRewardTokenInfos[_fixedRewardTokenIndex]
+            .finalRewardBlock = newFinal;
     }
 }
