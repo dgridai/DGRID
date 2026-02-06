@@ -711,26 +711,26 @@ contract DgridStakePool is
         tdgaiToken = _tdgaiToken;
     }
 
-    //about fixed reward token
-    function addFixedRewardToken(
-        address _rewardToken,
-        uint256 _rewardPerNodePerBlock
-    ) external onlyOwner {
-        require(_rewardToken != address(0), "reward token is zero address");
-        require(
-            _rewardPerNodePerBlock > 0,
-            "reward per node per block is zero"
-        );
-        fixedRewardTokenInfos.push(
-            FixedRewardTokenInfo({
-                rewardToken: ERC20(_rewardToken),
-                rewardPerNodePerBlock: _rewardPerNodePerBlock,
-                finalRewardBlock: 0
-            })
-        );
-    }
+    //about fixed reward token <---- Deprecated : Fixed token reward logic abandoned, Unable to add a new token
+    // function addFixedRewardToken(
+    //     address _rewardToken,
+    //     uint256 _rewardPerNodePerBlock
+    // ) external onlyOwner {
+    //     require(_rewardToken != address(0), "reward token is zero address");
+    //     require(
+    //         _rewardPerNodePerBlock > 0,
+    //         "reward per node per block is zero"
+    //     );
+    //     fixedRewardTokenInfos.push(
+    //         FixedRewardTokenInfo({
+    //             rewardToken: ERC20(_rewardToken),
+    //             rewardPerNodePerBlock: _rewardPerNodePerBlock,
+    //             finalRewardBlock: 0
+    //         })
+    //     );
+    // }
 
-    //pending fixed reward
+    //pending fixed reward  <---- Version compatibility : Compatible with remaining fixed token rewards, finalRewardBlock is set in 74024190 block height
     function pendingFixedReward(
         address _user
     )
@@ -881,66 +881,68 @@ contract DgridStakePool is
         }
     }
 
-    function setFixedRewardTokenFinalRewardBlock(
-        uint256 _fixedRewardTokenIndex,
-        uint256 _finalRewardBlock
-    ) external onlyOwner {
-        require(
-            _fixedRewardTokenIndex < fixedRewardTokenInfos.length,
-            "index out of range"
-        );
-        require(
-            _finalRewardBlock > block.number,
-            "final reward block is in the past"
-        );
-        fixedRewardTokenInfos[_fixedRewardTokenIndex]
-            .finalRewardBlock = _finalRewardBlock;
-    }
+    // set fixed reward token final reward block     <---- Deprecated : Fixed token reward logic abandoned, Unable to set final reward block
+    // function setFixedRewardTokenFinalRewardBlock(
+    //     uint256 _fixedRewardTokenIndex,
+    //     uint256 _finalRewardBlock
+    // ) external onlyOwner {
+    //     require(
+    //         _fixedRewardTokenIndex < fixedRewardTokenInfos.length,
+    //         "index out of range"
+    //     );
+    //     require(
+    //         _finalRewardBlock > block.number,
+    //         "final reward block is in the past"
+    //     );
+    //     fixedRewardTokenInfos[_fixedRewardTokenIndex]
+    //         .finalRewardBlock = _finalRewardBlock;
+    // }
 
-    //admin: adjust reward per block
-    function setFixedRewardPerBlock(
-        uint256[] memory _rewardFixedPerBlock
-    ) external onlyOwner {
-        require(
-            _rewardFixedPerBlock.length == fixedRewardTokenInfos.length,
-            "length mismatch"
-        );
-        require(block.number < startBlock, "already started");
-        for (uint256 i = 0; i < _rewardFixedPerBlock.length; i++) {
-            require(
-                _rewardFixedPerBlock[i] > 0,
-                "fixed reward per block is zero"
-            );
-            emit UpdateFixedRewardPerBlock(
-                address(fixedRewardTokenInfos[i].rewardToken),
-                fixedRewardTokenInfos[i].rewardPerNodePerBlock,
-                _rewardFixedPerBlock[i]
-            );
-            fixedRewardTokenInfos[i]
-                .rewardPerNodePerBlock = _rewardFixedPerBlock[i];
-        }
-    }
+    //admin: adjust reward per block     <---- Deprecated : Fixed token reward logic abandoned, Unable to adjust reward per block
+    // function setFixedRewardPerBlock(
+    //     uint256[] memory _rewardFixedPerBlock
+    // ) external onlyOwner {
+    //     require(
+    //         _rewardFixedPerBlock.length == fixedRewardTokenInfos.length,
+    //         "length mismatch"
+    //     );
+    //     require(block.number < startBlock, "already started");
+    //     for (uint256 i = 0; i < _rewardFixedPerBlock.length; i++) {
+    //         require(
+    //             _rewardFixedPerBlock[i] > 0,
+    //             "fixed reward per block is zero"
+    //         );
+    //         emit UpdateFixedRewardPerBlock(
+    //             address(fixedRewardTokenInfos[i].rewardToken),
+    //             fixedRewardTokenInfos[i].rewardPerNodePerBlock,
+    //             _rewardFixedPerBlock[i]
+    //         );
+    //         fixedRewardTokenInfos[i]
+    //             .rewardPerNodePerBlock = _rewardFixedPerBlock[i];
+    //     }
+    // }
 
-    function endFixedTokenReward(
-        uint256 _fixedRewardTokenIndex
-    ) external onlyOwner {
-        require(
-            _fixedRewardTokenIndex < fixedRewardTokenInfos.length,
-            "index out of range"
-        );
+    //set fixed reward token final reward block     <---- Deprecated : Fixed token reward logic abandoned, Unable to set final reward block
+    // function endFixedTokenReward(
+    //     uint256 _fixedRewardTokenIndex
+    // ) external onlyOwner {
+    //     require(
+    //         _fixedRewardTokenIndex < fixedRewardTokenInfos.length,
+    //         "index out of range"
+    //     );
 
-        uint256 oldFinal = fixedRewardTokenInfos[_fixedRewardTokenIndex]
-            .finalRewardBlock;
-        uint256 newFinal = block.number;
+    //     uint256 oldFinal = fixedRewardTokenInfos[_fixedRewardTokenIndex]
+    //         .finalRewardBlock;
+    //     uint256 newFinal = block.number;
 
-        // only allow tightening (oldFinal==0 means not set, also allow set)
-        require(oldFinal == 0 || newFinal < oldFinal, "final already earlier");
+    //     // only allow tightening (oldFinal==0 means not set, also allow set)
+    //     require(oldFinal == 0 || newFinal < oldFinal, "final already earlier");
 
-        fixedRewardTokenInfos[_fixedRewardTokenIndex]
-            .finalRewardBlock = newFinal;
-    }
+    //     fixedRewardTokenInfos[_fixedRewardTokenIndex]
+    //         .finalRewardBlock = newFinal;
+    // }
 
-    //transfer tdgai
+    //about transfer tdgai logic
     function getTdgaiAvailable(address _user) public view returns (uint256) {
         uint256 tdgaiIndex = type(uint256).max;
         for (uint256 i = 0; i < rewardTokenInfos.length; i++) {
