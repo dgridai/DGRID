@@ -379,6 +379,7 @@ contract DgridStakePool is
         uint256[] memory _nodeIds
     ) external nonReentrant whenUnstakeEnabled whenNotPaused {
         require(block.number >= startBlock, "not started");
+        require(_nodeIds.length > 0, "node ids is empty");
         for (uint256 i = 0; i < _nodeIds.length; i++) {
             require(dgridNode.ownerOf(_nodeIds[i]) == msg.sender, "not owner");
             require(!dgridNode.isJailed(_nodeIds[i]), "node is already jailed");
