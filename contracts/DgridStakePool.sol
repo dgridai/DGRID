@@ -80,6 +80,9 @@ contract DgridStakePool is
     mapping(address => uint256) public tdgaiTransferOut; //user address -> tdgai transfer out amount(minus)
     mapping(address => uint256) public tdgaiTransferIn; //user address -> tdgai transfer in amount(plus)
 
+    //signature nonce
+    mapping(uint256 => bool) public signatureNonceUsed;
+
     //signature action usage
     bytes32 private constant ACTION_DEPOSIT = keccak256("DEPOSIT");
     bytes32 private constant ACTION_UNJAIL = keccak256("UNJAIL");
@@ -325,6 +328,7 @@ contract DgridStakePool is
         uint256[] memory _nodes,
         address _staker,
         uint256 _expireTime,
+        uint256 _nonce,
         bytes calldata _signature
     ) external nonReentrant whenNotPaused {
         require(_staker != address(0), "staker is zero address");
@@ -339,6 +343,9 @@ contract DgridStakePool is
         }
         require(_expireTime > block.timestamp, "expire time is in the past");
 
+        require(!signatureNonceUsed[_nonce], "signature nonce already used");
+        signatureNonceUsed[_nonce] = true;
+
         // server sign check
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
             abi.encode(
@@ -346,7 +353,8 @@ contract DgridStakePool is
                 _nodes,
                 _staker,
                 _expireTime,
-                ACTION_DEPOSIT
+                ACTION_DEPOSIT,
+                _nonce
             )
         );
         address signer = ECDSA.recover(ethSignedMessageHash, _signature);
@@ -434,11 +442,15 @@ contract DgridStakePool is
         uint256[] memory _nodeIds,
         address _owner,
         uint256 _expireTime,
+        uint256 _nonce,
         bytes calldata _signature
     ) external nonReentrant whenNotPaused {
         require(_owner != address(0), "owner is zero address");
         require(_nodeIds.length > 0, "node ids is empty");
         require(_expireTime > block.timestamp, "expire time is in the past");
+
+        require(!signatureNonceUsed[_nonce], "signature nonce already used");
+        signatureNonceUsed[_nonce] = true;
 
         // server sign check
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
@@ -447,7 +459,8 @@ contract DgridStakePool is
                 _nodeIds,
                 _owner,
                 _expireTime,
-                ACTION_UNJAIL
+                ACTION_UNJAIL,
+                _nonce
             )
         );
         address signer = ECDSA.recover(ethSignedMessageHash, _signature);
