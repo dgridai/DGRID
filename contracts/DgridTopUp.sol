@@ -250,4 +250,27 @@ contract DgridTopUp is
         }
         emit EmergencyWithdraw(to, tokens, amounts);
     }
+
+    function deleteSupportedToken(address token) external onlyOwner {
+        require(token != address(0), "Invalid token");
+        require(
+            supportedTokensInfos[token].token != address(0),
+            "Token not supported"
+        );
+
+        // 1) delete mapping (disables topUp check)
+        delete supportedTokensInfos[token];
+
+        // 2) remove from array (swap & pop)
+        uint256 len = supportedTokens.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (supportedTokens[i] == token) {
+                if (i != len - 1) {
+                    supportedTokens[i] = supportedTokens[len - 1];
+                }
+                supportedTokens.pop();
+                break;
+            }
+        }
+    }
 }
