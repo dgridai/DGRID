@@ -12,6 +12,7 @@ import {
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import "./Interfaces/IDgridNode.sol";
+import "./Interfaces/ITdgaiTransferReceiver.sol";
 
 contract DgridStakePool is
     Initializable,
@@ -76,9 +77,16 @@ contract DgridStakePool is
     //tdgai token address
     address public tdgaiToken;
 
+    mapping(address => uint256) public tdgaiTransferOut; //user address -> tdgai transfer out amount(minus)
+    mapping(address => uint256) public tdgaiTransferIn; //user address -> tdgai transfer in amount(plus)
+
     //signature action usage
     bytes32 private constant ACTION_DEPOSIT = keccak256("DEPOSIT");
     bytes32 private constant ACTION_UNJAIL = keccak256("UNJAIL");
+
+    //tdgai transfer received selector
+    bytes4 private constant TDGAI_TRANSFER_RECEIVED =
+        ITdgaiTransferReceiver.onTdgaiTransfer.selector;
 
     event Deposit(address indexed user, uint256[] tokenIds);
     event JailNodes(address indexed user, uint256[] tokenIds);
@@ -110,6 +118,11 @@ contract DgridStakePool is
         address rewardToken,
         uint256 oldValue,
         uint256 newValue
+    );
+    event TransferTdgai(
+        address indexed from,
+        address indexed to,
+        uint256 amount
     );
 
     modifier whenUnstakeEnabled() {
@@ -483,7 +496,6 @@ contract DgridStakePool is
         );
         updatePool();
         for (uint256 i = 0; i < _rewardPerBlock.length; i++) {
-            require(_rewardPerBlock[i] > 0, "reward per block is zero");
             emit UpdateRewardPerBlock(
                 address(rewardTokenInfos[i].rewardToken),
                 rewardTokenInfos[i].rewardPerBlock,
@@ -519,7 +531,7 @@ contract DgridStakePool is
             _rewardTokenIndex < rewardTokenInfos.length,
             "index out of range"
         );
-        require(_rewardPerBlock > 0, "reward per block is zero");
+        updatePool();
         emit UpdateRewardPerBlock(
             address(rewardTokenInfos[_rewardTokenIndex].rewardToken),
             rewardTokenInfos[_rewardTokenIndex].rewardPerBlock,
@@ -659,6 +671,19 @@ contract DgridStakePool is
                     balance
                 );
             }
+        }
+    }
+
+    function emergencyWithdrawByToken(
+        address _token,
+        address _to
+    ) external onlyOwner whenPaused nonReentrant {
+        require(_token != address(0), "token is zero address");
+        require(_to != address(0), "to is zero address");
+        uint256 balance = ERC20(_token).balanceOf(address(this));
+        if (balance > 0) {
+            ERC20(_token).safeTransfer(_to, balance);
+            emit EmergencyWithdraw(_to, _token, balance);
         }
     }
 
@@ -908,10 +933,70 @@ contract DgridStakePool is
             .finalRewardBlock;
         uint256 newFinal = block.number;
 
-        // only allow tightening (oldFinal==0 means not set截止，also allow set)
+        // only allow tightening (oldFinal==0 means not set, also allow set)
         require(oldFinal == 0 || newFinal < oldFinal, "final already earlier");
 
         fixedRewardTokenInfos[_fixedRewardTokenIndex]
             .finalRewardBlock = newFinal;
+    }
+
+    //transfer tdgai
+    function getTdgaiAvailable(address _user) public view returns (uint256) {
+        uint256 tdgaiIndex = type(uint256).max;
+        for (uint256 i = 0; i < rewardTokenInfos.length; i++) {
+            if (address(rewardTokenInfos[i].rewardToken) == tdgaiToken) {
+                tdgaiIndex = i;
+                break;
+            }
+        }
+        require(tdgaiIndex != type(uint256).max, "tdgai token not found");
+
+        (, uint256[] memory pendingRewards, , , , ) = this.rewardInfo(_user);
+        uint256 pending = pendingRewards[tdgaiIndex];
+        uint256 plus = tdgaiTransferIn[_user];
+        uint256 minus = tdgaiTransferOut[_user];
+
+        if (pending + plus < minus) return 0; // prevent underflow
+        return pending + plus - minus;
+    }
+
+    function transferTdgai(
+        address _to,
+        uint256 _amount,
+        bytes calldata _data
+    ) external whenNotPaused nonReentrant {
+        require(_to != address(0), "to is zero address");
+        require(_to != msg.sender, "to is same as sender");
+        require(_amount > 0, "amount is zero");
+        updatePool();
+        _ensureUserInfoLen(msg.sender);
+        _accrueUnpaid(msg.sender);
+        _resetDebt(msg.sender);
+        uint256 currentBalance = getTdgaiAvailable(msg.sender);
+        require(currentBalance >= _amount, "insufficient tdgai balance");
+        tdgaiTransferIn[_to] += _amount; // transfer in to to
+        tdgaiTransferOut[msg.sender] += _amount; // transfer out from msg.sender
+        if (_isContract(_to)) {
+            _checkOnTdgaiTransfer(_to, msg.sender, _amount, _data);
+        }
+        emit TransferTdgai(msg.sender, _to, _amount);
+    }
+
+    function _checkOnTdgaiTransfer(
+        address _to,
+        address _from,
+        uint256 _amount,
+        bytes calldata _data
+    ) internal {
+        bytes4 retval = ITdgaiTransferReceiver(_to).onTdgaiTransfer(
+            _from,
+            _amount,
+            _data
+        );
+        require(retval == TDGAI_TRANSFER_RECEIVED, "tdgai receiver rejected");
+    }
+
+    function _isContract(address _account) internal view returns (bool) {
+        return _account.code.length > 0;
     }
 }
