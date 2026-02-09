@@ -108,7 +108,7 @@ contract DgridNode is Initializable, ERC721Upgradeable, OwnableUpgradeable {
     function unjail(uint256[] memory tokenIds) external onlyDgridStakePool {
         for (uint256 i = 0; i < tokenIds.length; i++) {
             require(isStaked[tokenIds[i]], "Node is not staked");
-            require(isJailed[tokenIds[i]], "Node is already jailed");
+            require(isJailed[tokenIds[i]], "Node is not jailed");
             isJailed[tokenIds[i]] = false;
         }
         emit Unjail(tokenIds);
