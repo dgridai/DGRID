@@ -11,6 +11,7 @@ import {
 } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
+import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import "./Interfaces/IDgridNode.sol";
 import "./Interfaces/ITdgaiTransferReceiver.sol";
 
@@ -976,6 +977,14 @@ contract DgridStakePool is
         return pending + plus - minus;
     }
 
+    /**
+     * @notice Transfers internal TDGAI balance to `_to`.
+     * @dev If `_to` supports `ITdgaiTransferReceiver` via ERC165, this function
+     *      calls `onTdgaiTransfer()` and requires the correct selector. EOAs that
+     *      enable EIP-7702 but do not implement ERC165 will not be called, avoiding
+     *      unintended reverts. Do not unconditionally trust `_data`; receiver
+     *      contracts must decode/validate it before use.
+     */
     function transferTdgai(
         address _to,
         uint256 _amount,
@@ -992,7 +1001,7 @@ contract DgridStakePool is
         require(currentBalance >= _amount, "insufficient tdgai balance");
         tdgaiTransferIn[_to] += _amount; // transfer in to to
         tdgaiTransferOut[msg.sender] += _amount; // transfer out from msg.sender
-        if (_isContract(_to)) {
+        if (_supportsTdgaiTransferReceiver(_to)) {
             _checkOnTdgaiTransfer(_to, msg.sender, _amount, _data);
         }
         emit TransferTdgai(msg.sender, _to, _amount);
@@ -1010,6 +1019,21 @@ contract DgridStakePool is
             _data
         );
         require(retval == TDGAI_TRANSFER_RECEIVED, "tdgai receiver rejected");
+    }
+
+    function _supportsTdgaiTransferReceiver(
+        address _account
+    ) internal view returns (bool) {
+        if (!_isContract(_account)) return false;
+        try
+            IERC165(_account).supportsInterface(
+                type(ITdgaiTransferReceiver).interfaceId
+            )
+        returns (bool supported) {
+            return supported;
+        } catch {
+            return false;
+        }
     }
 
     function _isContract(address _account) internal view returns (bool) {
