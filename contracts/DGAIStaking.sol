@@ -99,6 +99,8 @@ contract DGAIStaking is
     uint256 public totalDelegators;
     uint256 public llmTotalStakedAmount;
     uint256 public llmStakedCount;
+    /// @dev Total user principal held by this contract (node + llm staked + pending unstake principal). Protected from emergencyWithdraw.
+    uint256 public totalPrincipal;
     uint256 public llmCommissionRate; /// @dev the subsequent upgrade may not be zero.
     uint256 public teamNextClaimTime; // next team reward time for a 30 days
 
@@ -202,7 +204,7 @@ contract DGAIStaking is
         uint64 _coolingClaimDay, // 7 days
         uint64 _coolingTeamClaimDay, // 30 days
         uint64 _annualRewardRate,
-        GroupInfo[] memory _groupInfos, // 0: node, 1: delegator, 2: team
+        GroupInfo[] memory _groupInfos,
         address _server,
         address _dev
     ) external initializer {
@@ -232,7 +234,6 @@ contract DGAIStaking is
 
         server = _server;
         dev = _dev;
-        ///  Default node reward mode is fixed rate
         nodeRewardMode = NodeStakeMode.FixedRate;
 
         for (uint256 i = 0; i < _groupInfos.length; i++) {
@@ -272,6 +273,7 @@ contract DGAIStaking is
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
             abi.encode(
                 block.chainid,
+                address(this),
                 _nodeName,
                 _staker,
                 _amount,
@@ -303,6 +305,8 @@ contract DGAIStaking is
 
         _resetDebt(_staker, _staker);
         _resetNodeCommissionDebt(_staker);
+
+        totalPrincipal += _amount;
 
         emit CreateStakingNode(_staker, _nodeName, _amount, _commissionRate);
         emit Stake(_staker, _staker, _amount);
@@ -342,6 +346,8 @@ contract DGAIStaking is
             _resetNodeCommissionDebt(_node);
         }
 
+        totalPrincipal += _amount;
+
         emit Stake(_node, msg.sender, _amount);
     }
 
@@ -362,18 +368,26 @@ contract DGAIStaking is
         groupInfos[LLM_GROUP_ID].totalStaked = llmTotalStakedAmount;
 
         _resetLlmDebt(msg.sender);
+        totalPrincipal += _amount;
         emit StakeLlm(msg.sender, _amount);
     }
 
     function unstake(
         address _node,
         uint256 _amount
-    ) external nodeExists(_node) nonReentrant whenNotPaused {
+    ) external nodeExists(_node) nonReentrant {
         require(_amount > 0, "amount is zero");
         require(
             _amount <= userAmount[_node][msg.sender],
             "insufficient staked"
         );
+        if (msg.sender == _node) {
+            uint256 remaining = userAmount[_node][msg.sender] - _amount;
+            require(
+                remaining == 0 || remaining >= minNodeSelfStakeAmount,
+                "self stake below minimum"
+            );
+        }
 
         updateNodePool();
         _accrueUnpaid(_node, msg.sender);
@@ -387,6 +401,7 @@ contract DGAIStaking is
             earned =
                 (userUnpaid[_node][msg.sender] * _amount) /
                 stakedAmountBefore;
+            userUnpaid[_node][msg.sender] -= earned;
         }
 
         userAmount[_node][msg.sender] -= _amount;
@@ -415,10 +430,14 @@ contract DGAIStaking is
             releaseTime: releaseAt
         });
 
+        if (earned > 0) {
+            DGAI.safeTransfer(msg.sender, earned);
+        }
+
         emit Unstake(_node, msg.sender, requestId, _amount, earned, releaseAt);
     }
 
-    function unstakeLlm(uint256 _amount) external nonReentrant whenNotPaused {
+    function unstakeLlm(uint256 _amount) external nonReentrant {
         require(_amount > 0, "amount is zero");
         require(_amount <= llmUserAmount[msg.sender], "insufficient staked");
 
@@ -429,6 +448,7 @@ contract DGAIStaking is
         uint256 earned = 0;
         if (stakedAmountBefore > 0) {
             earned = (llmUserUnpaid[msg.sender] * _amount) / stakedAmountBefore;
+            llmUserUnpaid[msg.sender] -= earned;
         }
 
         llmUserAmount[msg.sender] -= _amount;
@@ -448,12 +468,14 @@ contract DGAIStaking is
             releaseTime: releaseAt
         });
 
+        if (earned > 0) {
+            DGAI.safeTransfer(msg.sender, earned);
+        }
+
         emit UnstakeLlm(msg.sender, requestId, _amount, earned, releaseAt);
     }
 
-    function claim(
-        address _node
-    ) external nodeExists(_node) nonReentrant whenNotPaused {
+    function claim(address _node) external nodeExists(_node) nonReentrant {
         require(
             block.timestamp >=
                 lastTimeClaimNode[_node][msg.sender] +
@@ -476,7 +498,7 @@ contract DGAIStaking is
     function claimUnstake(
         address _node,
         uint256 _requestId
-    ) external nodeExists(_node) nonReentrant whenNotPaused {
+    ) external nodeExists(_node) nonReentrant {
         PendingUnstake storage req = pendingUnstake[_node][msg.sender][
             _requestId
         ];
@@ -486,12 +508,13 @@ contract DGAIStaking is
         require(block.timestamp >= req.releaseTime, "cooling not finished");
 
         delete pendingUnstake[_node][msg.sender][_requestId];
+        totalPrincipal -= amount;
         DGAI.safeTransfer(msg.sender, amount);
 
         emit ClaimUnstake(_node, msg.sender, _requestId, amount);
     }
 
-    function claimNodeCommission() external nonReentrant whenNotPaused {
+    function claimNodeCommission() external nonReentrant {
         require(
             block.timestamp >=
                 lastTimeClaimNodeOwner[msg.sender] +
@@ -511,9 +534,7 @@ contract DGAIStaking is
         emit ClaimCommission(msg.sender, amount);
     }
 
-    function claimTeamReward(
-        address _target
-    ) external nonReentrant whenNotPaused {
+    function claimTeamReward(address _target) external nonReentrant {
         require(msg.sender == dev, "only dev can claim");
         require(_target != address(0), "target is zero");
         require(block.timestamp >= teamNextClaimTime, "team claim cooling");
@@ -535,7 +556,7 @@ contract DGAIStaking is
         emit ClaimTeamReward(_target, amount, teamNextClaimTime);
     }
 
-    function claimLlm() external nonReentrant whenNotPaused {
+    function claimLlm() external nonReentrant {
         require(
             block.timestamp >=
                 lastTimeClaimLlm[msg.sender] +
@@ -557,9 +578,7 @@ contract DGAIStaking is
         emit ClaimLlm(msg.sender, amount);
     }
 
-    function claimUnstakeLlm(
-        uint256 _requestId
-    ) external nonReentrant whenNotPaused {
+    function claimUnstakeLlm(uint256 _requestId) external nonReentrant {
         PendingUnstake storage req = pendingUnstakeLlm[msg.sender][_requestId];
         uint256 amount = req.amount;
 
@@ -567,6 +586,7 @@ contract DGAIStaking is
         require(block.timestamp >= req.releaseTime, "cooling not finished");
 
         delete pendingUnstakeLlm[msg.sender][_requestId];
+        totalPrincipal -= amount;
         DGAI.safeTransfer(msg.sender, amount);
 
         emit ClaimUnstakeLlm(msg.sender, _requestId, amount);
@@ -926,6 +946,7 @@ contract DGAIStaking is
         if (pending > 0) {
             llmUserUnpaid[_user] += pending;
         }
+        _resetLlmDebt(_user);
     }
 
     function _accrueTeamUnpaid(address _user) internal {
@@ -970,14 +991,20 @@ contract DGAIStaking is
             ACC_PRECISION;
     }
 
-    /// @notice Emergency withdraw DGAI from this contract.
-    /// @dev Owner-only emergency path that transfers the core token (DGAI).
+    /// @notice Emergency withdraw surplus DGAI (reward pool funds), user principal is protected.
+    /// @dev Owner can only withdraw the amount exceeding totalPrincipal (user staked + pending unstake principal).
     function emergencyWithdraw(
         address _target,
         uint256 _amount
     ) external onlyOwner {
         require(_target != address(0), "target is zero");
         require(_amount > 0, "amount is zero");
+
+        uint256 balance = DGAI.balanceOf(address(this));
+        uint256 withdrawable = balance > totalPrincipal
+            ? balance - totalPrincipal
+            : 0;
+        require(_amount <= withdrawable, "exceeds withdrawable surplus");
 
         DGAI.safeTransfer(_target, _amount);
         emit EmergencyWithdraw(address(DGAI), _target, _amount);
