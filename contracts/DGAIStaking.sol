@@ -166,6 +166,7 @@ contract DGAIStaking is
     event SetCoolingUnstakeDay(uint64 oldValue, uint64 newValue);
     event SetCoolingTeamClaimDay(uint64 oldValue, uint64 newValue);
     event SetLlmCommissionRate(uint256 oldValue, uint256 newValue);
+    event SetCoolingClaimDay(uint64 oldValue, uint64 newValue);
     event SwitchNodeRewardMode(
         NodeStakeMode indexed oldMode,
         NodeStakeMode indexed newMode
@@ -384,7 +385,7 @@ contract DGAIStaking is
         if (msg.sender == _node) {
             uint256 remaining = userAmount[_node][msg.sender] - _amount;
             require(
-                remaining == 0 || remaining >= minNodeSelfStakeAmount,
+                remaining >= minNodeSelfStakeAmount,
                 "self stake below minimum"
             );
         }
@@ -540,13 +541,12 @@ contract DGAIStaking is
         require(block.timestamp >= teamNextClaimTime, "team claim cooling");
 
         updateTeamPool();
-        _accrueTeamUnpaid(dev);
+        _accrueTeamUnpaid(dev); /// built-in resetDebt function
 
         uint256 amount = teamUnpaid[dev];
         require(amount > 0, "no team reward");
 
         teamUnpaid[dev] = 0;
-        _resetTeamDebt(dev);
 
         teamNextClaimTime =
             block.timestamp +
@@ -728,6 +728,11 @@ contract DGAIStaking is
         coolingTeamClaimDay = _coolingTeamClaimDay;
     }
 
+    function setCoolClaimDay(uint64 _coolingClaimDay) external onlyOwner {
+        emit SetCoolingClaimDay(coolingClaimDay, _coolingClaimDay);
+        coolingClaimDay = _coolingClaimDay;
+    }
+
     function setAnnualRewardRate(uint64 _rate) external onlyOwner {
         require(nodeRewardMode == NodeStakeMode.FixedRate, "not fixedRate");
         updateNodePool();
@@ -789,6 +794,10 @@ contract DGAIStaking is
         require(_server != address(0), "server is zero");
         server = _server;
         emit SetServer(_server);
+    }
+
+    function setDev(address _dev) external onlyOwner {
+        dev = _dev;
     }
 
     function _updateGroup(uint8 _groupId) internal {
@@ -962,6 +971,7 @@ contract DGAIStaking is
         if (pending > 0) {
             teamUnpaid[_user] += pending;
         }
+        _resetTeamDebt(_user);
     }
 
     function _resetDebt(address _node, address _user) internal {
