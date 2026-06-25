@@ -487,7 +487,10 @@ contract DGAIStaking is
         _accrueUnpaid(_node, msg.sender);
 
         uint256 amount = userUnpaid[_node][msg.sender];
-        require(amount > 0, "no rewards , maybe stake activity not started");
+        require(
+            amount + totalPrincipal <= DGAI.balanceOf(address(this)),
+            "pool insufficient balance"
+        );
 
         userUnpaid[_node][msg.sender] = 0;
         lastTimeClaimNode[_node][msg.sender] = block.timestamp;
@@ -526,7 +529,10 @@ contract DGAIStaking is
         _accrueNodeCommission(msg.sender);
 
         uint256 amount = nodeCommissionUnpaid[msg.sender];
-        require(amount > 0, "no commission , maybe stake activity not started");
+        require(
+            amount + totalPrincipal <= DGAI.balanceOf(address(this)),
+            "pool insufficient balance"
+        );
 
         nodeCommissionUnpaid[msg.sender] = 0;
         lastTimeClaimNodeOwner[msg.sender] = block.timestamp;
@@ -544,7 +550,10 @@ contract DGAIStaking is
         _accrueTeamUnpaid(); /// built-in resetDebt function
 
         uint256 amount = teamUnpaid;
-        require(amount > 0, "no team reward");
+        require(
+            amount + totalPrincipal <= DGAI.balanceOf(address(this)),
+            "pool insufficient balance"
+        );
 
         teamUnpaid = 0;
 
@@ -567,7 +576,10 @@ contract DGAIStaking is
         _accrueLlmUnpaid(msg.sender);
 
         uint256 amount = llmUserUnpaid[msg.sender];
-        require(amount > 0, "no rewards");
+        require(
+            amount + totalPrincipal <= DGAI.balanceOf(address(this)),
+            "pool insufficient balance"
+        );
 
         llmUserUnpaid[msg.sender] = 0;
         _resetLlmDebt(msg.sender);
