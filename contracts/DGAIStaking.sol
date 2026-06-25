@@ -85,8 +85,8 @@ contract DGAIStaking is
     mapping(address => mapping(uint256 => PendingUnstake))
         public pendingUnstakeLlm;
 
-    mapping(address => uint256) public teamRewardDebt;
-    mapping(address => uint256) public teamUnpaid;
+    uint256 public teamRewardDebt;
+    uint256 public teamUnpaid;
 
     mapping(uint256 => bool) public signedNonce;
 
@@ -541,12 +541,12 @@ contract DGAIStaking is
         require(block.timestamp >= teamNextClaimTime, "team claim cooling");
 
         updateTeamPool();
-        _accrueTeamUnpaid(dev); /// built-in resetDebt function
+        _accrueTeamUnpaid(); /// built-in resetDebt function
 
-        uint256 amount = teamUnpaid[dev];
+        uint256 amount = teamUnpaid;
         require(amount > 0, "no team reward");
 
-        teamUnpaid[dev] = 0;
+        teamUnpaid = 0;
 
         teamNextClaimTime =
             block.timestamp +
@@ -665,10 +665,10 @@ contract DGAIStaking is
     function pendingTeamReward() external view returns (uint256) {
         uint256 accumulated = (TEAM_SHARE *
             _previewGroupAccRewardPerShare(TEAM_GROUP_ID)) / ACC_PRECISION;
-        uint256 debt = teamRewardDebt[dev];
+        uint256 debt = teamRewardDebt;
         uint256 gross = accumulated > debt ? accumulated - debt : 0;
 
-        return teamUnpaid[dev] + gross;
+        return teamUnpaid + gross;
     }
 
     function getAccPershareLen() external view returns (uint256) {
@@ -958,20 +958,16 @@ contract DGAIStaking is
         _resetLlmDebt(_user);
     }
 
-    function _accrueTeamUnpaid(address _user) internal {
-        if (_user != dev) {
-            return;
-        }
-
+    function _accrueTeamUnpaid() internal {
         uint256 accumulated = (TEAM_SHARE * accRewardPerShares[TEAM_GROUP_ID]) /
             ACC_PRECISION;
-        uint256 debt = teamRewardDebt[_user];
+        uint256 debt = teamRewardDebt;
         uint256 pending = accumulated > debt ? accumulated - debt : 0;
 
         if (pending > 0) {
-            teamUnpaid[_user] += pending;
+            teamUnpaid += pending;
         }
-        _resetTeamDebt(_user);
+        _resetTeamDebt();
     }
 
     function _resetDebt(address _node, address _user) internal {
@@ -992,11 +988,8 @@ contract DGAIStaking is
             ACC_PRECISION;
     }
 
-    function _resetTeamDebt(address _user) internal {
-        if (_user != dev) {
-            return;
-        }
-        teamRewardDebt[_user] =
+    function _resetTeamDebt() internal {
+        teamRewardDebt =
             (TEAM_SHARE * accRewardPerShares[TEAM_GROUP_ID]) /
             ACC_PRECISION;
     }
