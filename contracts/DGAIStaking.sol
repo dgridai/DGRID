@@ -34,12 +34,20 @@ contract DGAIStaking is
     }
 
     bytes32 private constant ACTION_CREATE_NODE = keccak256("CREATENODE");
+    bytes32 private constant ACTION_UNJAIL = keccak256("UNJAIL");
+    bytes32 private constant ACTION_JAIL = keccak256("JAIL");
 
     struct StakingNode {
         string nodeName;
         uint256 amount;
         uint256 delegatorCount;
         uint256 commissionRate;
+        /// @dev nodeStatus lifecycle (reserved for future upgrade):x
+        ///      contract upgrade logic by appending the nodeStatus field.
+        // status: 0 => jail, 1 => active , expand ... depends on upgrade logic
+        uint8 nodeStatus;
+        uint256 missedAcc;
+        uint256 jailedAcc;
     }
 
     // groupId = 0 : node reward, 1 : team reward, 2 : llm reward
@@ -53,6 +61,8 @@ contract DGAIStaking is
     GroupInfo[] public groupInfos;
     // accRewardPerShares[0] : node reward, accRewardPerShares[1] : team reward, accRewardPerShares[2] : llm reward
     uint256[] public accRewardPerShares;
+    /// @dev  The unallocated remainder from the previous division in each pool (multiplied by the ACC_PRECISION scale) is carried over to the next accumulation to avoid precision loss during high-frequency updates.
+    uint256[] public accRewardRemainders;
 
     /// @notice Pending unstake request released after the cooling period
     struct PendingUnstake {
@@ -85,8 +95,8 @@ contract DGAIStaking is
     mapping(address => mapping(uint256 => PendingUnstake))
         public pendingUnstakeLlm;
 
-    mapping(address => uint256) public teamRewardDebt;
-    mapping(address => uint256) public teamUnpaid;
+    uint256 public teamRewardDebt;
+    uint256 public teamUnpaid;
 
     mapping(uint256 => bool) public signedNonce;
 
@@ -95,7 +105,7 @@ contract DGAIStaking is
     uint256 public minLlmStakeAmount;
     uint256 public minDelegatorStakeAmount;
     uint256 public totalStakingNodes;
-    uint256 public totalStakedAmount;
+
     uint256 public totalDelegators;
     uint256 public llmTotalStakedAmount;
     uint256 public llmStakedCount;
@@ -126,9 +136,10 @@ contract DGAIStaking is
         address indexed staker,
         uint256 indexed requestId,
         uint256 amount,
-        uint256 earned,
         uint256 releaseTime
     );
+    event JailNode(address indexed node);
+    event UnjailedNode(address indexed node);
     event Claim(address indexed node, address indexed staker, uint256 amount);
     event ClaimCommission(address indexed node, uint256 amount);
     event ClaimTeamReward(
@@ -141,7 +152,6 @@ contract DGAIStaking is
         address indexed staker,
         uint256 indexed requestId,
         uint256 amount,
-        uint256 earned,
         uint256 releaseTime
     );
     event ClaimLlm(address indexed staker, uint256 amount);
@@ -172,6 +182,10 @@ contract DGAIStaking is
         NodeStakeMode indexed newMode
     );
     event SetServer(address indexed server);
+    event SetDev(address indexed dev);
+    event SetMinNodeSelfStakeAmount(uint256 oldValue, uint256 newValue);
+    event SetMinLlmStakeAmount(uint256 oldValue, uint256 newValue);
+    event SetMinDelegatorStakeAmount(uint256 oldValue, uint256 newValue);
     event EmergencyWithdraw(
         address indexed token,
         address indexed target,
@@ -221,6 +235,7 @@ contract DGAIStaking is
         );
         require(_groupInfos.length == 3, "group length mismatch");
 
+        ///  @notice  The `owner` is held by a multisig / Timelock contract in production , guarantee not to do evil.
         __Ownable_init(_owner);
         __ReentrancyGuard_init();
 
@@ -245,6 +260,7 @@ contract DGAIStaking is
             group.totalStaked = group.groupId == TEAM_GROUP_ID ? TEAM_SHARE : 0;
             groupInfos.push(group);
             accRewardPerShares.push(0);
+            accRewardRemainders.push(0);
         }
     }
 
@@ -293,6 +309,7 @@ contract DGAIStaking is
         DGAI.safeTransferFrom(msg.sender, address(this), _amount);
 
         StakingNode storage node = stakingNodeMap[_staker];
+        node.nodeStatus = 1; // active staking
         node.nodeName = _nodeName;
         node.amount = _amount;
         node.commissionRate = _commissionRate;
@@ -301,8 +318,8 @@ contract DGAIStaking is
         userAmount[_staker][_staker] = _amount;
         totalStakingNodes++;
         totalDelegators++;
-        totalStakedAmount += _amount;
-        groupInfos[NODE_GROUP_ID].totalStaked = totalStakedAmount;
+
+        groupInfos[NODE_GROUP_ID].totalStaked += _amount;
 
         _resetDebt(_staker, _staker);
         _resetNodeCommissionDebt(_staker);
@@ -321,7 +338,7 @@ contract DGAIStaking is
         require(_amount >= minDelegatorStakeAmount, "amount below minimum");
 
         StakingNode storage node = stakingNodeMap[_node];
-
+        require(node.nodeStatus == 1, "node not staking");
         updateNodePool();
         _accrueUnpaid(_node, msg.sender);
         if (msg.sender != _node) {
@@ -338,8 +355,7 @@ contract DGAIStaking is
 
         userAmount[_node][msg.sender] = beforeAmount + _amount;
         node.amount += _amount;
-        totalStakedAmount += _amount;
-        groupInfos[NODE_GROUP_ID].totalStaked = totalStakedAmount;
+        groupInfos[NODE_GROUP_ID].totalStaked += _amount;
 
         _resetDebt(_node, msg.sender);
         if (msg.sender != _node) {
@@ -396,15 +412,6 @@ contract DGAIStaking is
             _accrueNodeCommission(_node);
         }
 
-        uint256 stakedAmountBefore = userAmount[_node][msg.sender];
-        uint256 earned = 0;
-        if (stakedAmountBefore > 0) {
-            earned =
-                (userUnpaid[_node][msg.sender] * _amount) /
-                stakedAmountBefore;
-            userUnpaid[_node][msg.sender] -= earned;
-        }
-
         userAmount[_node][msg.sender] -= _amount;
 
         StakingNode storage node = stakingNodeMap[_node];
@@ -413,9 +420,9 @@ contract DGAIStaking is
             node.delegatorCount--;
             totalDelegators--;
         }
-
-        totalStakedAmount -= _amount;
-        groupInfos[NODE_GROUP_ID].totalStaked = totalStakedAmount;
+        if (node.nodeStatus == 1) {
+            groupInfos[NODE_GROUP_ID].totalStaked -= _amount;
+        }
 
         _resetDebt(_node, msg.sender);
         if (msg.sender != _node) {
@@ -431,11 +438,7 @@ contract DGAIStaking is
             releaseTime: releaseAt
         });
 
-        if (earned > 0) {
-            DGAI.safeTransfer(msg.sender, earned);
-        }
-
-        emit Unstake(_node, msg.sender, requestId, _amount, earned, releaseAt);
+        emit Unstake(_node, msg.sender, requestId, _amount, releaseAt);
     }
 
     function unstakeLlm(uint256 _amount) external nonReentrant {
@@ -444,13 +447,6 @@ contract DGAIStaking is
 
         updateLlmPool();
         _accrueLlmUnpaid(msg.sender);
-
-        uint256 stakedAmountBefore = llmUserAmount[msg.sender];
-        uint256 earned = 0;
-        if (stakedAmountBefore > 0) {
-            earned = (llmUserUnpaid[msg.sender] * _amount) / stakedAmountBefore;
-            llmUserUnpaid[msg.sender] -= earned;
-        }
 
         llmUserAmount[msg.sender] -= _amount;
         llmTotalStakedAmount -= _amount;
@@ -469,11 +465,7 @@ contract DGAIStaking is
             releaseTime: releaseAt
         });
 
-        if (earned > 0) {
-            DGAI.safeTransfer(msg.sender, earned);
-        }
-
-        emit UnstakeLlm(msg.sender, requestId, _amount, earned, releaseAt);
+        emit UnstakeLlm(msg.sender, requestId, _amount, releaseAt);
     }
 
     function claim(address _node) external nodeExists(_node) nonReentrant {
@@ -487,7 +479,10 @@ contract DGAIStaking is
         _accrueUnpaid(_node, msg.sender);
 
         uint256 amount = userUnpaid[_node][msg.sender];
-        require(amount > 0, "no rewards , maybe stake activity not started");
+        require(
+            amount + totalPrincipal <= DGAI.balanceOf(address(this)),
+            "pool insufficient balance"
+        );
 
         userUnpaid[_node][msg.sender] = 0;
         lastTimeClaimNode[_node][msg.sender] = block.timestamp;
@@ -526,7 +521,10 @@ contract DGAIStaking is
         _accrueNodeCommission(msg.sender);
 
         uint256 amount = nodeCommissionUnpaid[msg.sender];
-        require(amount > 0, "no commission , maybe stake activity not started");
+        require(
+            amount + totalPrincipal <= DGAI.balanceOf(address(this)),
+            "pool insufficient balance"
+        );
 
         nodeCommissionUnpaid[msg.sender] = 0;
         lastTimeClaimNodeOwner[msg.sender] = block.timestamp;
@@ -535,18 +533,90 @@ contract DGAIStaking is
         emit ClaimCommission(msg.sender, amount);
     }
 
+    // node jail and unjail
+    function jailNode(
+        address _node,
+        uint256 _deadline,
+        uint256 _nonce,
+        bytes calldata _signature
+    ) external nodeExists(_node) {
+        StakingNode storage node = stakingNodeMap[_node];
+        require(node.nodeStatus == 1, "already jailed");
+        require(_deadline > block.timestamp, "deadline is in the past");
+        require(!signedNonce[_nonce], "signature nonce already used");
+        signedNonce[_nonce] = true;
+
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
+            abi.encode(
+                block.chainid,
+                address(this),
+                _node,
+                _deadline,
+                ACTION_JAIL,
+                _nonce
+            )
+        );
+        address signer = ECDSA.recover(ethSignedMessageHash, _signature);
+        require(signer == server, "invalid signature");
+
+        updateNodePool();
+        node.jailedAcc = accRewardPerShares[NODE_GROUP_ID];
+        /// @notice jailed node status is 0 and the node not produce any reward to user and owner.
+        // Remove the node's stake from the global divisor so that under
+        // AccPerShare mode a jailed node neither earns nor dilutes others.
+        groupInfos[NODE_GROUP_ID].totalStaked -= node.amount;
+        node.nodeStatus = 0;
+        emit JailNode(_node);
+    }
+
+    function unjailNode(
+        address _node,
+        uint256 _deadline,
+        uint256 _nonce,
+        bytes calldata _signature
+    ) external nodeExists(_node) {
+        StakingNode storage node = stakingNodeMap[_node];
+        require(node.nodeStatus == 0, "not jailed");
+        require(_deadline > block.timestamp, "deadline is in the past");
+        require(!signedNonce[_nonce], "signature nonce already used");
+        signedNonce[_nonce] = true;
+
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
+            abi.encode(
+                block.chainid,
+                address(this),
+                _node,
+                _deadline,
+                ACTION_UNJAIL,
+                _nonce
+            )
+        );
+        address signer = ECDSA.recover(ethSignedMessageHash, _signature);
+        require(signer == server, "invalid signature");
+
+        updateNodePool();
+        groupInfos[NODE_GROUP_ID].totalStaked += node.amount;
+
+        node.missedAcc += accRewardPerShares[NODE_GROUP_ID] - node.jailedAcc;
+        node.nodeStatus = 1;
+        emit UnjailedNode(_node);
+    }
+
     function claimTeamReward(address _target) external nonReentrant {
         require(msg.sender == dev, "only dev can claim");
         require(_target != address(0), "target is zero");
         require(block.timestamp >= teamNextClaimTime, "team claim cooling");
 
         updateTeamPool();
-        _accrueTeamUnpaid(dev); /// built-in resetDebt function
+        _accrueTeamUnpaid(); /// built-in resetDebt function
 
-        uint256 amount = teamUnpaid[dev];
-        require(amount > 0, "no team reward");
+        uint256 amount = teamUnpaid;
+        require(
+            amount + totalPrincipal <= DGAI.balanceOf(address(this)),
+            "pool insufficient team reward"
+        );
 
-        teamUnpaid[dev] = 0;
+        teamUnpaid = 0;
 
         teamNextClaimTime =
             block.timestamp +
@@ -567,7 +637,10 @@ contract DGAIStaking is
         _accrueLlmUnpaid(msg.sender);
 
         uint256 amount = llmUserUnpaid[msg.sender];
-        require(amount > 0, "no rewards");
+        require(
+            amount + totalPrincipal <= DGAI.balanceOf(address(this)),
+            "pool insufficient balance"
+        );
 
         llmUserUnpaid[msg.sender] = 0;
         _resetLlmDebt(msg.sender);
@@ -614,8 +687,7 @@ contract DGAIStaking is
             return pending;
         }
 
-        uint256 accumulated = (amount * _previewNodeAccRewardPerShare()) /
-            ACC_PRECISION;
+        uint256 accumulated = (amount * _previewNodeAcc(_node)) / ACC_PRECISION;
         uint256 debt = userRewardDebt[_node][_user];
         uint256 pendingGross = accumulated > debt ? accumulated - debt : 0;
 
@@ -637,8 +709,8 @@ contract DGAIStaking is
             return nodeCommissionUnpaid[_node];
         }
 
-        uint256 accumulated = (delegatedAmount *
-            _previewNodeAccRewardPerShare()) / ACC_PRECISION;
+        uint256 accumulated = (delegatedAmount * _previewNodeAcc(_node)) /
+            ACC_PRECISION;
         uint256 debt = nodeDelegatedRewardDebt[_node];
         uint256 gross = accumulated > debt ? accumulated - debt : 0;
         uint256 fee = (gross * stakingNodeMap[_node].commissionRate) /
@@ -665,10 +737,10 @@ contract DGAIStaking is
     function pendingTeamReward() external view returns (uint256) {
         uint256 accumulated = (TEAM_SHARE *
             _previewGroupAccRewardPerShare(TEAM_GROUP_ID)) / ACC_PRECISION;
-        uint256 debt = teamRewardDebt[dev];
+        uint256 debt = teamRewardDebt;
         uint256 gross = accumulated > debt ? accumulated - debt : 0;
 
-        return teamUnpaid[dev] + gross;
+        return teamUnpaid + gross;
     }
 
     function getAccPershareLen() external view returns (uint256) {
@@ -682,35 +754,36 @@ contract DGAIStaking is
     function getAnnualStakingEmission(
         uint256 _groupId
     ) external view returns (uint256 released) {
-        require(_groupId < groupInfos.length, "invalid group");
+        if (!groupInfos[_groupId].enabled) {
+            return 0;
+        }
 
         if (_groupId == NODE_GROUP_ID) {
             if (nodeRewardMode == NodeStakeMode.FixedRate) {
                 return
-                    (totalStakedAmount * uint256(annualRewardRate)) /
-                    BPS_DENOMINATOR;
+                    (groupInfos[_groupId].totalStaked *
+                        uint256(annualRewardRate)) / BPS_DENOMINATOR;
             }
             if (nodeRewardMode == NodeStakeMode.NoReward) {
                 return 0;
             }
         }
 
-        if (!groupInfos[_groupId].enabled) {
-            return 0;
-        }
-
         return uint256(groupInfos[_groupId].perSecondReward) * 365 days;
     }
 
     function setMinLlmStakeAmount(uint256 _minAmount) external onlyOwner {
+        emit SetMinLlmStakeAmount(minLlmStakeAmount, _minAmount);
         minLlmStakeAmount = _minAmount;
     }
 
     function setMinDelegatorStakeAmount(uint256 _minAmount) external onlyOwner {
+        emit SetMinDelegatorStakeAmount(minDelegatorStakeAmount, _minAmount);
         minDelegatorStakeAmount = _minAmount;
     }
 
     function setMinNodeSelfStakeAmount(uint256 _minAmount) external onlyOwner {
+        emit SetMinNodeSelfStakeAmount(minNodeSelfStakeAmount, _minAmount);
         minNodeSelfStakeAmount = _minAmount;
     }
 
@@ -797,7 +870,9 @@ contract DGAIStaking is
     }
 
     function setDev(address _dev) external onlyOwner {
+        require(_dev != address(0), "dev is zero");
         dev = _dev;
+        emit SetDev(_dev);
     }
 
     function _updateGroup(uint8 _groupId) internal {
@@ -812,36 +887,42 @@ contract DGAIStaking is
             return;
         }
 
-        uint256 reward = 0;
+        uint256 dt = nowTs - group.lastRewardTime;
+        uint256 deltaAcc = 0;
 
-        if (_groupId == NODE_GROUP_ID) {
-            if (nodeRewardMode == NodeStakeMode.NoReward) {
+        if (
+            _groupId == NODE_GROUP_ID &&
+            nodeRewardMode == NodeStakeMode.FixedRate
+        ) {
+            uint256 denominator = BPS_DENOMINATOR * 365 days;
+            uint256 numerator = uint256(annualRewardRate) *
+                dt *
+                ACC_PRECISION +
+                accRewardRemainders[_groupId];
+            deltaAcc = numerator / denominator;
+            // keep the remainder for next time
+            accRewardRemainders[_groupId] = numerator % denominator;
+        } else {
+            if (
+                _groupId == NODE_GROUP_ID &&
+                nodeRewardMode == NodeStakeMode.NoReward
+            ) {
                 group.lastRewardTime = uint64(nowTs);
                 return;
             }
 
-            if (nodeRewardMode == NodeStakeMode.FixedRate) {
-                reward =
-                    (group.totalStaked *
-                        uint256(annualRewardRate) *
-                        (nowTs - group.lastRewardTime)) /
-                    BPS_DENOMINATOR /
-                    365 days;
-            } else {
-                reward =
-                    uint256(group.perSecondReward) *
-                    (nowTs - group.lastRewardTime);
-            }
-        } else {
-            reward =
-                uint256(group.perSecondReward) *
-                (nowTs - group.lastRewardTime);
+            // scaled = perSecond * dt * ACC_PRECISION + remainder,
+            // then scaled / totalStaked = deltaAcc + new remainder
+            uint256 scaled = uint256(group.perSecondReward) *
+                dt *
+                ACC_PRECISION +
+                accRewardRemainders[_groupId];
+            deltaAcc = scaled / group.totalStaked;
+            accRewardRemainders[_groupId] = scaled % group.totalStaked;
         }
 
-        if (reward > 0) {
-            accRewardPerShares[_groupId] +=
-                (reward * ACC_PRECISION) /
-                group.totalStaked;
+        if (deltaAcc > 0) {
+            accRewardPerShares[_groupId] += deltaAcc;
         }
         group.lastRewardTime = uint64(nowTs);
     }
@@ -862,39 +943,59 @@ contract DGAIStaking is
             return acc;
         }
 
-        uint256 reward = 0;
+        uint256 dt = nowTs - group.lastRewardTime;
+        uint256 deltaAcc = 0;
 
-        if (_groupId == NODE_GROUP_ID) {
-            if (nodeRewardMode == NodeStakeMode.NoReward) {
+        if (
+            _groupId == NODE_GROUP_ID &&
+            nodeRewardMode == NodeStakeMode.FixedRate
+        ) {
+            uint256 denominator = BPS_DENOMINATOR * 365 days;
+            uint256 numerator = uint256(annualRewardRate) *
+                dt *
+                ACC_PRECISION +
+                accRewardRemainders[_groupId];
+            deltaAcc = numerator / denominator;
+        } else {
+            if (
+                _groupId == NODE_GROUP_ID &&
+                nodeRewardMode == NodeStakeMode.NoReward
+            ) {
                 return acc;
             }
-            if (nodeRewardMode == NodeStakeMode.FixedRate) {
-                reward =
-                    (group.totalStaked *
-                        uint256(annualRewardRate) *
-                        (nowTs - group.lastRewardTime)) /
-                    BPS_DENOMINATOR /
-                    365 days;
-            } else {
-                reward =
-                    uint256(group.perSecondReward) *
-                    (nowTs - group.lastRewardTime);
-            }
-        } else {
-            reward =
-                uint256(group.perSecondReward) *
-                (nowTs - group.lastRewardTime);
+
+            uint256 scaled = uint256(group.perSecondReward) *
+                dt *
+                ACC_PRECISION +
+                accRewardRemainders[_groupId];
+            deltaAcc = scaled / group.totalStaked;
         }
 
-        if (reward == 0) {
-            return acc;
-        }
-
-        return acc + ((reward * ACC_PRECISION) / group.totalStaked);
+        return acc + deltaAcc;
     }
 
-    function _previewNodeAccRewardPerShare() internal view returns (uint256) {
-        return _previewGroupAccRewardPerShare(NODE_GROUP_ID);
+    /// @dev Effective accPerShare for a node, derived from the global node acc.
+    ///      Subtracts the acc the node missed while jailed (`missedAcc`).
+    ///      While jailed, the acc is frozen at the snapshot taken on jail
+    ///      (`jailedAcc`), so users under the node stop accruing new rewards
+    ///      but keep whatever was already settled into `userUnpaid`.
+    function _nodeAcc(address _node) internal view returns (uint256) {
+        StakingNode storage node = stakingNodeMap[_node];
+        uint256 acc = node.nodeStatus == 0
+            ? node.jailedAcc
+            : accRewardPerShares[NODE_GROUP_ID];
+        return acc - node.missedAcc;
+    }
+
+    /// @dev View counterpart of `_nodeAcc` that also previews pending global
+    ///      acc growth (so off-chain reads stay accurate between updates).
+    ///      A jailed node returns its frozen acc with no preview growth.
+    function _previewNodeAcc(address _node) internal view returns (uint256) {
+        StakingNode storage node = stakingNodeMap[_node];
+        uint256 acc = node.nodeStatus == 0
+            ? node.jailedAcc
+            : _previewGroupAccRewardPerShare(NODE_GROUP_ID);
+        return acc - node.missedAcc;
     }
 
     function _accrueUnpaid(address _node, address _user) internal {
@@ -903,8 +1004,7 @@ contract DGAIStaking is
             return;
         }
 
-        uint256 accumulated = (amount * accRewardPerShares[NODE_GROUP_ID]) /
-            ACC_PRECISION;
+        uint256 accumulated = (amount * _nodeAcc(_node)) / ACC_PRECISION;
         uint256 debt = userRewardDebt[_node][_user];
         uint256 pendingGross = accumulated > debt ? accumulated - debt : 0;
 
@@ -928,8 +1028,8 @@ contract DGAIStaking is
             return;
         }
 
-        uint256 accumulated = (delegatedAmount *
-            accRewardPerShares[NODE_GROUP_ID]) / ACC_PRECISION;
+        uint256 accumulated = (delegatedAmount * _nodeAcc(_node)) /
+            ACC_PRECISION;
         uint256 debt = nodeDelegatedRewardDebt[_node];
         uint256 gross = accumulated > debt ? accumulated - debt : 0;
         uint256 fee = (gross * stakingNodeMap[_node].commissionRate) /
@@ -958,31 +1058,27 @@ contract DGAIStaking is
         _resetLlmDebt(_user);
     }
 
-    function _accrueTeamUnpaid(address _user) internal {
-        if (_user != dev) {
-            return;
-        }
-
+    function _accrueTeamUnpaid() internal {
         uint256 accumulated = (TEAM_SHARE * accRewardPerShares[TEAM_GROUP_ID]) /
             ACC_PRECISION;
-        uint256 debt = teamRewardDebt[_user];
+        uint256 debt = teamRewardDebt;
         uint256 pending = accumulated > debt ? accumulated - debt : 0;
 
         if (pending > 0) {
-            teamUnpaid[_user] += pending;
+            teamUnpaid += pending;
         }
-        _resetTeamDebt(_user);
+        _resetTeamDebt();
     }
 
     function _resetDebt(address _node, address _user) internal {
         userRewardDebt[_node][_user] =
-            (userAmount[_node][_user] * accRewardPerShares[NODE_GROUP_ID]) /
+            (userAmount[_node][_user] * _nodeAcc(_node)) /
             ACC_PRECISION;
     }
 
     function _resetNodeCommissionDebt(address _node) internal {
         nodeDelegatedRewardDebt[_node] =
-            (nodeDelegatedAmount[_node] * accRewardPerShares[NODE_GROUP_ID]) /
+            (nodeDelegatedAmount[_node] * _nodeAcc(_node)) /
             ACC_PRECISION;
     }
 
@@ -992,17 +1088,15 @@ contract DGAIStaking is
             ACC_PRECISION;
     }
 
-    function _resetTeamDebt(address _user) internal {
-        if (_user != dev) {
-            return;
-        }
-        teamRewardDebt[_user] =
+    function _resetTeamDebt() internal {
+        teamRewardDebt =
             (TEAM_SHARE * accRewardPerShares[TEAM_GROUP_ID]) /
             ACC_PRECISION;
     }
 
     /// @notice Emergency withdraw surplus DGAI (reward pool funds), user principal is protected.
     /// @dev Owner can only withdraw the amount exceeding totalPrincipal (user staked + pending unstake principal).
+    ///     The `owner` is held by a multisig / Timelock contract in production , guarantee not to do evil.
     function emergencyWithdraw(
         address _target,
         uint256 _amount
