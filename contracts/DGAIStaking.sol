@@ -178,6 +178,10 @@ contract DGAIStaking is
         NodeStakeMode indexed newMode
     );
     event SetServer(address indexed server);
+    event SetDev(address indexed dev);
+    event SetMinNodeSelfStakeAmount(uint256 oldValue, uint256 newValue);
+    event SetMinLlmStakeAmount(uint256 oldValue, uint256 newValue);
+    event SetMinDelegatorStakeAmount(uint256 oldValue, uint256 newValue);
     event EmergencyWithdraw(
         address indexed token,
         address indexed target,
@@ -726,14 +730,17 @@ contract DGAIStaking is
     }
 
     function setMinLlmStakeAmount(uint256 _minAmount) external onlyOwner {
+        emit SetMinLlmStakeAmount(minLlmStakeAmount, _minAmount);
         minLlmStakeAmount = _minAmount;
     }
 
     function setMinDelegatorStakeAmount(uint256 _minAmount) external onlyOwner {
+        emit SetMinDelegatorStakeAmount(minDelegatorStakeAmount, _minAmount);
         minDelegatorStakeAmount = _minAmount;
     }
 
     function setMinNodeSelfStakeAmount(uint256 _minAmount) external onlyOwner {
+        emit SetMinNodeSelfStakeAmount(minNodeSelfStakeAmount, _minAmount);
         minNodeSelfStakeAmount = _minAmount;
     }
 
@@ -820,7 +827,9 @@ contract DGAIStaking is
     }
 
     function setDev(address _dev) external onlyOwner {
+        require(_dev != address(0), "dev is zero");
         dev = _dev;
+        emit SetDev(_dev);
     }
 
     function _updateGroup(uint8 _groupId) internal {
