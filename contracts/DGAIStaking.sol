@@ -53,6 +53,8 @@ contract DGAIStaking is
     GroupInfo[] public groupInfos;
     // accRewardPerShares[0] : node reward, accRewardPerShares[1] : team reward, accRewardPerShares[2] : llm reward
     uint256[] public accRewardPerShares;
+    /// @dev  The unallocated remainder from the previous division in each pool (multiplied by the ACC_PRECISION scale) is carried over to the next accumulation to avoid precision loss during high-frequency updates.
+    uint256[] public accRewardRemainders;
 
     /// @notice Pending unstake request released after the cooling period
     struct PendingUnstake {
@@ -245,6 +247,7 @@ contract DGAIStaking is
             group.totalStaked = group.groupId == TEAM_GROUP_ID ? TEAM_SHARE : 0;
             groupInfos.push(group);
             accRewardPerShares.push(0);
+            accRewardRemainders.push(0);
         }
     }
 
@@ -824,36 +827,42 @@ contract DGAIStaking is
             return;
         }
 
-        uint256 reward = 0;
+        uint256 dt = nowTs - group.lastRewardTime;
+        uint256 deltaAcc = 0;
 
-        if (_groupId == NODE_GROUP_ID) {
-            if (nodeRewardMode == NodeStakeMode.NoReward) {
+        if (
+            _groupId == NODE_GROUP_ID &&
+            nodeRewardMode == NodeStakeMode.FixedRate
+        ) {
+            uint256 denominator = BPS_DENOMINATOR * 365 days;
+            uint256 numerator = uint256(annualRewardRate) *
+                dt *
+                ACC_PRECISION +
+                accRewardRemainders[_groupId];
+            deltaAcc = numerator / denominator;
+            // keep the remainder for next time
+            accRewardRemainders[_groupId] = numerator % denominator;
+        } else {
+            if (
+                _groupId == NODE_GROUP_ID &&
+                nodeRewardMode == NodeStakeMode.NoReward
+            ) {
                 group.lastRewardTime = uint64(nowTs);
                 return;
             }
 
-            if (nodeRewardMode == NodeStakeMode.FixedRate) {
-                reward =
-                    (group.totalStaked *
-                        uint256(annualRewardRate) *
-                        (nowTs - group.lastRewardTime)) /
-                    BPS_DENOMINATOR /
-                    365 days;
-            } else {
-                reward =
-                    uint256(group.perSecondReward) *
-                    (nowTs - group.lastRewardTime);
-            }
-        } else {
-            reward =
-                uint256(group.perSecondReward) *
-                (nowTs - group.lastRewardTime);
+            // scaled = perSecond * dt * ACC_PRECISION + remainder,
+            // then scaled / totalStaked = deltaAcc + new remainder
+            uint256 scaled = uint256(group.perSecondReward) *
+                dt *
+                ACC_PRECISION +
+                accRewardRemainders[_groupId];
+            deltaAcc = scaled / group.totalStaked;
+            accRewardRemainders[_groupId] = scaled % group.totalStaked;
         }
 
-        if (reward > 0) {
-            accRewardPerShares[_groupId] +=
-                (reward * ACC_PRECISION) /
-                group.totalStaked;
+        if (deltaAcc > 0) {
+            accRewardPerShares[_groupId] += deltaAcc;
         }
         group.lastRewardTime = uint64(nowTs);
     }
@@ -874,35 +883,35 @@ contract DGAIStaking is
             return acc;
         }
 
-        uint256 reward = 0;
+        uint256 dt = nowTs - group.lastRewardTime;
+        uint256 deltaAcc = 0;
 
-        if (_groupId == NODE_GROUP_ID) {
-            if (nodeRewardMode == NodeStakeMode.NoReward) {
+        if (
+            _groupId == NODE_GROUP_ID &&
+            nodeRewardMode == NodeStakeMode.FixedRate
+        ) {
+            uint256 denominator = BPS_DENOMINATOR * 365 days;
+            uint256 numerator = uint256(annualRewardRate) *
+                dt *
+                ACC_PRECISION +
+                accRewardRemainders[_groupId];
+            deltaAcc = numerator / denominator;
+        } else {
+            if (
+                _groupId == NODE_GROUP_ID &&
+                nodeRewardMode == NodeStakeMode.NoReward
+            ) {
                 return acc;
             }
-            if (nodeRewardMode == NodeStakeMode.FixedRate) {
-                reward =
-                    (group.totalStaked *
-                        uint256(annualRewardRate) *
-                        (nowTs - group.lastRewardTime)) /
-                    BPS_DENOMINATOR /
-                    365 days;
-            } else {
-                reward =
-                    uint256(group.perSecondReward) *
-                    (nowTs - group.lastRewardTime);
-            }
-        } else {
-            reward =
-                uint256(group.perSecondReward) *
-                (nowTs - group.lastRewardTime);
+
+            uint256 scaled = uint256(group.perSecondReward) *
+                dt *
+                ACC_PRECISION +
+                accRewardRemainders[_groupId];
+            deltaAcc = scaled / group.totalStaked;
         }
 
-        if (reward == 0) {
-            return acc;
-        }
-
-        return acc + ((reward * ACC_PRECISION) / group.totalStaked);
+        return acc + deltaAcc;
     }
 
     function _previewNodeAccRewardPerShare() internal view returns (uint256) {
