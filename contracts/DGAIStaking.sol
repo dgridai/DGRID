@@ -703,7 +703,9 @@ contract DGAIStaking is
     function getAnnualStakingEmission(
         uint256 _groupId
     ) external view returns (uint256 released) {
-        require(_groupId < groupInfos.length, "invalid group");
+        if (!groupInfos[_groupId].enabled) {
+            return 0;
+        }
 
         if (_groupId == NODE_GROUP_ID) {
             if (nodeRewardMode == NodeStakeMode.FixedRate) {
