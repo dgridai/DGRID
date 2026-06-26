@@ -34,16 +34,20 @@ contract DGAIStaking is
     }
 
     bytes32 private constant ACTION_CREATE_NODE = keccak256("CREATENODE");
+    bytes32 private constant ACTION_UNJAIL = keccak256("UNJAIL");
+    bytes32 private constant ACTION_JAIL = keccak256("JAIL");
 
     struct StakingNode {
         string nodeName;
         uint256 amount;
         uint256 delegatorCount;
         uint256 commissionRate;
-        ///  @dev nodeStatus lifecycle (reserved for future upgrade):x
+        /// @dev nodeStatus lifecycle (reserved for future upgrade):x
         ///      contract upgrade logic by appending the nodeStatus field.
         // status: 0 => jail, 1 => active , expand ... depends on upgrade logic
         uint8 nodeStatus;
+        uint256 missedAcc;
+        uint256 jailedAcc;
     }
 
     // groupId = 0 : node reward, 1 : team reward, 2 : llm reward
@@ -101,7 +105,7 @@ contract DGAIStaking is
     uint256 public minLlmStakeAmount;
     uint256 public minDelegatorStakeAmount;
     uint256 public totalStakingNodes;
-    uint256 public totalStakedAmount;
+
     uint256 public totalDelegators;
     uint256 public llmTotalStakedAmount;
     uint256 public llmStakedCount;
@@ -132,9 +136,10 @@ contract DGAIStaking is
         address indexed staker,
         uint256 indexed requestId,
         uint256 amount,
-        uint256 earned,
         uint256 releaseTime
     );
+    event JailNode(address indexed node);
+    event UnjailedNode(address indexed node);
     event Claim(address indexed node, address indexed staker, uint256 amount);
     event ClaimCommission(address indexed node, uint256 amount);
     event ClaimTeamReward(
@@ -147,7 +152,6 @@ contract DGAIStaking is
         address indexed staker,
         uint256 indexed requestId,
         uint256 amount,
-        uint256 earned,
         uint256 releaseTime
     );
     event ClaimLlm(address indexed staker, uint256 amount);
@@ -314,8 +318,8 @@ contract DGAIStaking is
         userAmount[_staker][_staker] = _amount;
         totalStakingNodes++;
         totalDelegators++;
-        totalStakedAmount += _amount;
-        groupInfos[NODE_GROUP_ID].totalStaked = totalStakedAmount;
+
+        groupInfos[NODE_GROUP_ID].totalStaked += _amount;
 
         _resetDebt(_staker, _staker);
         _resetNodeCommissionDebt(_staker);
@@ -351,8 +355,7 @@ contract DGAIStaking is
 
         userAmount[_node][msg.sender] = beforeAmount + _amount;
         node.amount += _amount;
-        totalStakedAmount += _amount;
-        groupInfos[NODE_GROUP_ID].totalStaked = totalStakedAmount;
+        groupInfos[NODE_GROUP_ID].totalStaked += _amount;
 
         _resetDebt(_node, msg.sender);
         if (msg.sender != _node) {
@@ -409,15 +412,6 @@ contract DGAIStaking is
             _accrueNodeCommission(_node);
         }
 
-        uint256 stakedAmountBefore = userAmount[_node][msg.sender];
-        uint256 earned = 0;
-        if (stakedAmountBefore > 0) {
-            earned =
-                (userUnpaid[_node][msg.sender] * _amount) /
-                stakedAmountBefore;
-            userUnpaid[_node][msg.sender] -= earned;
-        }
-
         userAmount[_node][msg.sender] -= _amount;
 
         StakingNode storage node = stakingNodeMap[_node];
@@ -426,9 +420,9 @@ contract DGAIStaking is
             node.delegatorCount--;
             totalDelegators--;
         }
-
-        totalStakedAmount -= _amount;
-        groupInfos[NODE_GROUP_ID].totalStaked = totalStakedAmount;
+        if (node.nodeStatus == 1) {
+            groupInfos[NODE_GROUP_ID].totalStaked -= _amount;
+        }
 
         _resetDebt(_node, msg.sender);
         if (msg.sender != _node) {
@@ -444,11 +438,7 @@ contract DGAIStaking is
             releaseTime: releaseAt
         });
 
-        if (earned > 0) {
-            DGAI.safeTransfer(msg.sender, earned);
-        }
-
-        emit Unstake(_node, msg.sender, requestId, _amount, earned, releaseAt);
+        emit Unstake(_node, msg.sender, requestId, _amount, releaseAt);
     }
 
     function unstakeLlm(uint256 _amount) external nonReentrant {
@@ -457,13 +447,6 @@ contract DGAIStaking is
 
         updateLlmPool();
         _accrueLlmUnpaid(msg.sender);
-
-        uint256 stakedAmountBefore = llmUserAmount[msg.sender];
-        uint256 earned = 0;
-        if (stakedAmountBefore > 0) {
-            earned = (llmUserUnpaid[msg.sender] * _amount) / stakedAmountBefore;
-            llmUserUnpaid[msg.sender] -= earned;
-        }
 
         llmUserAmount[msg.sender] -= _amount;
         llmTotalStakedAmount -= _amount;
@@ -482,11 +465,7 @@ contract DGAIStaking is
             releaseTime: releaseAt
         });
 
-        if (earned > 0) {
-            DGAI.safeTransfer(msg.sender, earned);
-        }
-
-        emit UnstakeLlm(msg.sender, requestId, _amount, earned, releaseAt);
+        emit UnstakeLlm(msg.sender, requestId, _amount, releaseAt);
     }
 
     function claim(address _node) external nodeExists(_node) nonReentrant {
@@ -554,6 +533,75 @@ contract DGAIStaking is
         emit ClaimCommission(msg.sender, amount);
     }
 
+    // node jail and unjail
+    function jailNode(
+        address _node,
+        uint256 _deadline,
+        uint256 _nonce,
+        bytes calldata _signature
+    ) external nodeExists(_node) {
+        StakingNode storage node = stakingNodeMap[_node];
+        require(node.nodeStatus == 1, "already jailed");
+        require(_deadline > block.timestamp, "deadline is in the past");
+        require(!signedNonce[_nonce], "signature nonce already used");
+        signedNonce[_nonce] = true;
+
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
+            abi.encode(
+                block.chainid,
+                address(this),
+                _node,
+                _deadline,
+                ACTION_JAIL,
+                _nonce
+            )
+        );
+        address signer = ECDSA.recover(ethSignedMessageHash, _signature);
+        require(signer == server, "invalid signature");
+
+        updateNodePool();
+        node.jailedAcc = accRewardPerShares[NODE_GROUP_ID];
+        /// @notice jailed node status is 0 and the node not produce any reward to user and owner.
+        // Remove the node's stake from the global divisor so that under
+        // AccPerShare mode a jailed node neither earns nor dilutes others.
+        groupInfos[NODE_GROUP_ID].totalStaked -= node.amount;
+        node.nodeStatus = 0;
+        emit JailNode(_node);
+    }
+
+    function unjailNode(
+        address _node,
+        uint256 _deadline,
+        uint256 _nonce,
+        bytes calldata _signature
+    ) external nodeExists(_node) {
+        StakingNode storage node = stakingNodeMap[_node];
+        require(node.nodeStatus == 0, "not jailed");
+        require(_deadline > block.timestamp, "deadline is in the past");
+        require(!signedNonce[_nonce], "signature nonce already used");
+        signedNonce[_nonce] = true;
+
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
+            abi.encode(
+                block.chainid,
+                address(this),
+                _node,
+                _deadline,
+                ACTION_UNJAIL,
+                _nonce
+            )
+        );
+        address signer = ECDSA.recover(ethSignedMessageHash, _signature);
+        require(signer == server, "invalid signature");
+
+        updateNodePool();
+        groupInfos[NODE_GROUP_ID].totalStaked += node.amount;
+
+        node.missedAcc += accRewardPerShares[NODE_GROUP_ID] - node.jailedAcc;
+        node.nodeStatus = 1;
+        emit UnjailedNode(_node);
+    }
+
     function claimTeamReward(address _target) external nonReentrant {
         require(msg.sender == dev, "only dev can claim");
         require(_target != address(0), "target is zero");
@@ -565,7 +613,7 @@ contract DGAIStaking is
         uint256 amount = teamUnpaid;
         require(
             amount + totalPrincipal <= DGAI.balanceOf(address(this)),
-            "pool insufficient balance"
+            "pool insufficient team reward"
         );
 
         teamUnpaid = 0;
@@ -639,8 +687,7 @@ contract DGAIStaking is
             return pending;
         }
 
-        uint256 accumulated = (amount * _previewNodeAccRewardPerShare()) /
-            ACC_PRECISION;
+        uint256 accumulated = (amount * _previewNodeAcc(_node)) / ACC_PRECISION;
         uint256 debt = userRewardDebt[_node][_user];
         uint256 pendingGross = accumulated > debt ? accumulated - debt : 0;
 
@@ -662,8 +709,8 @@ contract DGAIStaking is
             return nodeCommissionUnpaid[_node];
         }
 
-        uint256 accumulated = (delegatedAmount *
-            _previewNodeAccRewardPerShare()) / ACC_PRECISION;
+        uint256 accumulated = (delegatedAmount * _previewNodeAcc(_node)) /
+            ACC_PRECISION;
         uint256 debt = nodeDelegatedRewardDebt[_node];
         uint256 gross = accumulated > debt ? accumulated - debt : 0;
         uint256 fee = (gross * stakingNodeMap[_node].commissionRate) /
@@ -714,16 +761,12 @@ contract DGAIStaking is
         if (_groupId == NODE_GROUP_ID) {
             if (nodeRewardMode == NodeStakeMode.FixedRate) {
                 return
-                    (totalStakedAmount * uint256(annualRewardRate)) /
-                    BPS_DENOMINATOR;
+                    (groupInfos[_groupId].totalStaked *
+                        uint256(annualRewardRate)) / BPS_DENOMINATOR;
             }
             if (nodeRewardMode == NodeStakeMode.NoReward) {
                 return 0;
             }
-        }
-
-        if (!groupInfos[_groupId].enabled) {
-            return 0;
         }
 
         return uint256(groupInfos[_groupId].perSecondReward) * 365 days;
@@ -931,8 +974,28 @@ contract DGAIStaking is
         return acc + deltaAcc;
     }
 
-    function _previewNodeAccRewardPerShare() internal view returns (uint256) {
-        return _previewGroupAccRewardPerShare(NODE_GROUP_ID);
+    /// @dev Effective accPerShare for a node, derived from the global node acc.
+    ///      Subtracts the acc the node missed while jailed (`missedAcc`).
+    ///      While jailed, the acc is frozen at the snapshot taken on jail
+    ///      (`jailedAcc`), so users under the node stop accruing new rewards
+    ///      but keep whatever was already settled into `userUnpaid`.
+    function _nodeAcc(address _node) internal view returns (uint256) {
+        StakingNode storage node = stakingNodeMap[_node];
+        uint256 acc = node.nodeStatus == 0
+            ? node.jailedAcc
+            : accRewardPerShares[NODE_GROUP_ID];
+        return acc - node.missedAcc;
+    }
+
+    /// @dev View counterpart of `_nodeAcc` that also previews pending global
+    ///      acc growth (so off-chain reads stay accurate between updates).
+    ///      A jailed node returns its frozen acc with no preview growth.
+    function _previewNodeAcc(address _node) internal view returns (uint256) {
+        StakingNode storage node = stakingNodeMap[_node];
+        uint256 acc = node.nodeStatus == 0
+            ? node.jailedAcc
+            : _previewGroupAccRewardPerShare(NODE_GROUP_ID);
+        return acc - node.missedAcc;
     }
 
     function _accrueUnpaid(address _node, address _user) internal {
@@ -941,8 +1004,7 @@ contract DGAIStaking is
             return;
         }
 
-        uint256 accumulated = (amount * accRewardPerShares[NODE_GROUP_ID]) /
-            ACC_PRECISION;
+        uint256 accumulated = (amount * _nodeAcc(_node)) / ACC_PRECISION;
         uint256 debt = userRewardDebt[_node][_user];
         uint256 pendingGross = accumulated > debt ? accumulated - debt : 0;
 
@@ -966,8 +1028,8 @@ contract DGAIStaking is
             return;
         }
 
-        uint256 accumulated = (delegatedAmount *
-            accRewardPerShares[NODE_GROUP_ID]) / ACC_PRECISION;
+        uint256 accumulated = (delegatedAmount * _nodeAcc(_node)) /
+            ACC_PRECISION;
         uint256 debt = nodeDelegatedRewardDebt[_node];
         uint256 gross = accumulated > debt ? accumulated - debt : 0;
         uint256 fee = (gross * stakingNodeMap[_node].commissionRate) /
@@ -1010,13 +1072,13 @@ contract DGAIStaking is
 
     function _resetDebt(address _node, address _user) internal {
         userRewardDebt[_node][_user] =
-            (userAmount[_node][_user] * accRewardPerShares[NODE_GROUP_ID]) /
+            (userAmount[_node][_user] * _nodeAcc(_node)) /
             ACC_PRECISION;
     }
 
     function _resetNodeCommissionDebt(address _node) internal {
         nodeDelegatedRewardDebt[_node] =
-            (nodeDelegatedAmount[_node] * accRewardPerShares[NODE_GROUP_ID]) /
+            (nodeDelegatedAmount[_node] * _nodeAcc(_node)) /
             ACC_PRECISION;
     }
 
