@@ -40,6 +40,10 @@ contract DGAIStaking is
         uint256 amount;
         uint256 delegatorCount;
         uint256 commissionRate;
+        ///  @dev nodeStatus lifecycle (reserved for future upgrade):x
+        ///      contract upgrade logic by appending the nodeStatus field.
+        // status: 0 => jail, 1 => active , expand ... depends on upgrade logic
+        uint8 nodeStatus;
     }
 
     // groupId = 0 : node reward, 1 : team reward, 2 : llm reward
@@ -223,6 +227,7 @@ contract DGAIStaking is
         );
         require(_groupInfos.length == 3, "group length mismatch");
 
+        ///  @notice  The `owner` is held by a multisig / Timelock contract in production , guarantee not to do evil.
         __Ownable_init(_owner);
         __ReentrancyGuard_init();
 
@@ -296,6 +301,7 @@ contract DGAIStaking is
         DGAI.safeTransferFrom(msg.sender, address(this), _amount);
 
         StakingNode storage node = stakingNodeMap[_staker];
+        node.nodeStatus = 1; // active staking
         node.nodeName = _nodeName;
         node.amount = _amount;
         node.commissionRate = _commissionRate;
@@ -324,7 +330,7 @@ contract DGAIStaking is
         require(_amount >= minDelegatorStakeAmount, "amount below minimum");
 
         StakingNode storage node = stakingNodeMap[_node];
-
+        require(node.nodeStatus == 1, "node not staking");
         updateNodePool();
         _accrueUnpaid(_node, msg.sender);
         if (msg.sender != _node) {
