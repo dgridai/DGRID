@@ -1017,6 +1017,7 @@ contract DGAIStaking is
 
     /// @notice Emergency withdraw surplus DGAI (reward pool funds), user principal is protected.
     /// @dev Owner can only withdraw the amount exceeding totalPrincipal (user staked + pending unstake principal).
+    ///     The `owner` is held by a multisig / Timelock contract in production , guarantee not to do evil.
     function emergencyWithdraw(
         address _target,
         uint256 _amount
