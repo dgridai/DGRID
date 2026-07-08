@@ -6,9 +6,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {
-    MessageHashUtils
-} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
@@ -1005,6 +1003,44 @@ contract DgridStakePool is
             _checkOnTdgaiTransfer(_to, msg.sender, _amount, _data);
         }
         emit TransferTdgai(msg.sender, _to, _amount);
+    }
+
+    function batchTransferTdgai(
+        address[] calldata _tos,
+        uint256[] calldata _amounts
+    ) external whenNotPaused nonReentrant {
+        uint256 len = _tos.length;
+        require(len == _amounts.length, "length mismatch");
+        require(len > 0, "empty batch");
+
+        updatePool();
+        _ensureUserInfoLen(msg.sender);
+        _accrueUnpaid(msg.sender);
+        _resetDebt(msg.sender);
+
+        uint256 totalAmount = 0;
+
+        for (uint256 i = 0; i < len; ) {
+            address to = _tos[i];
+            uint256 amount = _amounts[i];
+
+            require(to != address(0), "to is zero address");
+            require(to != msg.sender, "to is same as sender");
+            require(amount > 0, "amount is zero");
+
+            tdgaiTransferIn[to] += amount;
+            emit TransferTdgai(msg.sender, to, amount);
+            totalAmount += amount;
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        uint256 currentBalance = getTdgaiAvailable(msg.sender);
+        require(currentBalance >= totalAmount, "insufficient tdgai balance");
+
+        tdgaiTransferOut[msg.sender] += totalAmount;
     }
 
     function _checkOnTdgaiTransfer(
