@@ -12,6 +12,7 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import "./Interfaces/IDgridNode.sol";
 import "./Interfaces/ITdgaiTransferReceiver.sol";
+import "./Interfaces/IDGAIStaking.sol";
 
 contract DgridStakePool is
     Initializable,
@@ -90,10 +91,16 @@ contract DgridStakePool is
     bytes4 private constant TDGAI_TRANSFER_RECEIVED =
         ITdgaiTransferReceiver.onTdgaiTransfer.selector;
 
+    /// @dev upgrade v3
+    address public airdropAddress; /// @notice abandon the variable
+    mapping(uint8 => mapping(string => bool)) public preInitialized;
+    mapping(address => uint8) public preStaked; // 0: not pre staked, 1: pre staked // 2: stsaked in staking contract
+    address public dgaiStaking;
     event Deposit(address indexed user, uint256[] tokenIds);
     event JailNodes(address indexed user, uint256[] tokenIds);
     event UnjailNodes(address indexed user, uint256[] tokenIds);
     event Harvest(address indexed user, uint256 amount, address rewardToken);
+    event HarvestFee(address indexed user, uint256 amount, address rewardToken);
     event UpdateStartBlock(uint256 oldValue, uint256 newValue);
     event UpdateServer(address oldValue, address newValue);
     event UpdateRewardPerBlock(
@@ -126,6 +133,24 @@ contract DgridStakePool is
         address indexed to,
         uint256 amount
     );
+    event PreClaimAndStake(
+        address indexed user,
+        string indexed uid,
+        uint8 cid,
+        uint8 index,
+        uint256 preClaimAmount,
+        uint256 stakeAmount
+    );
+    event Airdrop(address[] users, uint256[] amounts);
+    event HandlePreStake(address indexed user);
+    event RestakeReward(address indexed user, uint256 amount);
+
+    /// @dev upgrade v3
+    // dgai fee recipient
+    address public feeRecipient;
+    // dgai fee amount
+    uint256 public feeAmount;
+    uint64 public dgaiRewardIndex;
 
     modifier whenUnstakeEnabled() {
         require(unstakeEnabled, "unstake is not enabled");
@@ -194,6 +219,10 @@ contract DgridStakePool is
     function initializeV2(address _tdgaiToken) external reinitializer(2) {
         require(_tdgaiToken != address(0), "tdgai token is zero address");
         tdgaiToken = _tdgaiToken;
+    }
+
+    function initializeV3() external reinitializer(3) {
+        dgaiRewardIndex = uint64(rewardTokenInfos.length - 1);
     }
 
     //add reward token
@@ -499,6 +528,46 @@ contract DgridStakePool is
         _resetUserFixedLatestRewardBlock(msg.sender);
     }
 
+    // compound Rewards to staking pool
+    function restakeReward(
+        uint64 _selectNodeId,
+        uint64 _day
+    ) external nonReentrant whenNotPaused {
+        require(dgaiStaking != address(0), "staking is zero address");
+        updatePool();
+        _ensureUserInfoLen(msg.sender);
+        _accrueUnpaid(msg.sender);
+        // dgai reward
+        UserInfo storage user = userInfo[msg.sender];
+        uint256 amount = user.unpaidRewards[dgaiRewardIndex];
+
+        require(amount > 0, "amount is zero");
+        user.unpaidRewards[dgaiRewardIndex] = 0;
+        user.paidRewards[dgaiRewardIndex] += amount;
+
+        _resetDebt(msg.sender);
+        ERC20 dgaiToken = rewardTokenInfos[dgaiRewardIndex].rewardToken;
+
+        // instead of using forceApprove, we manually reset the approval to zero and then approve the amount.
+        require(dgaiToken.approve(dgaiStaking, 0), "approve 0 failed");
+        require(
+            dgaiToken.approve(dgaiStaking, amount),
+            "approve amount failed"
+        );
+        IDGAIStaking(dgaiStaking).restakeRewardCall(
+            _selectNodeId,
+            _day,
+            amount,
+            msg.sender
+        );
+        emit RestakeReward(msg.sender, amount);
+    }
+
+    function setStakingAddress(address _dgaiStaking) external onlyOwner {
+        require(_dgaiStaking != address(0), "staking is zero address");
+        dgaiStaking = _dgaiStaking;
+    }
+
     //admin: adjust reward per block
     function setRewardPerBlock(
         uint256[] memory _rewardPerBlock
@@ -569,6 +638,71 @@ contract DgridStakePool is
         }
     }
 
+    function preClaimAndStake(
+        uint8 _index,
+        uint8 _cid,
+        string memory _uid
+    ) external {
+        require(paused, "!paused");
+        require(_index < 3, "index is out of range");
+        require(_cid == 0 || _cid == 1, "cid is out of range");
+        require(preStaked[msg.sender] == 0, "pre staked already");
+        updatePool();
+        _ensureUserInfoLen(msg.sender);
+        _accrueUnpaid(msg.sender);
+        _resetDebt(msg.sender);
+        uint256 amount = getTdgaiAvailable(msg.sender);
+        require(amount > 0, "tdgai is not available or claimed yet");
+        uint256 preClaimAmount = 0;
+        uint256 stakeAmount = 0;
+        if (_index == 0) {
+            preClaimAmount = amount / 10;
+            stakeAmount = amount - preClaimAmount;
+        } else if (_index == 1) {
+            preClaimAmount = amount / 5;
+            stakeAmount = amount - preClaimAmount;
+        } else if (_index == 2) {
+            preClaimAmount = (amount * 3) / 10;
+        }
+        preInitialized[_cid][_uid] = true;
+        preStaked[msg.sender] = 1;
+        tdgaiTransferOut[msg.sender] += amount;
+        tdgaiTransferIn[address(0)] += amount;
+        emit PreClaimAndStake(
+            msg.sender,
+            _uid,
+            _cid,
+            _index,
+            preClaimAmount,
+            stakeAmount
+        );
+    }
+
+    function handlePreStakeCall(address _user) external {
+        require(msg.sender == dgaiStaking, "not DgaiStaking address");
+        require(checkPreStaked(_user) == 1, "invalid pre staked already");
+        preStaked[_user] = 2;
+        emit HandlePreStake(_user);
+    }
+
+    function airdrop(
+        address[] calldata _users,
+        uint256[] calldata _amounts
+    ) external nonReentrant whenNotPaused onlyOwner {
+        require(
+            _users.length == _amounts.length && _users.length > 0,
+            "length mismatch"
+        );
+        updatePool();
+
+        for (uint256 i = 0; i < _users.length; i++) {
+            require(_users[i] != address(0), "user is zero");
+            require(_amounts[i] > 0, "amount is zero");
+            tdgaiTransferIn[_users[i]] += _amounts[i];
+        }
+        emit Airdrop(_users, _amounts);
+    }
+
     function _payReward(address _user) internal {
         UserInfo storage user = userInfo[_user];
         for (uint256 i = 0; i < rewardTokenInfos.length; i++) {
@@ -577,14 +711,24 @@ contract DgridStakePool is
             }
             uint256 toPay = user.unpaidRewards[i];
             if (toPay > 0) {
+                ERC20 rewardToken = rewardTokenInfos[i].rewardToken;
                 user.unpaidRewards[i] = 0;
                 user.paidRewards[i] += toPay;
-                rewardTokenInfos[i].rewardToken.safeTransfer(_user, toPay);
-                emit Harvest(
-                    _user,
-                    toPay,
-                    address(rewardTokenInfos[i].rewardToken)
-                );
+                if (
+                    i == dgaiRewardIndex &&
+                    feeRecipient != address(0) &&
+                    feeAmount > 0
+                ) {
+                    require(
+                        toPay > feeAmount,
+                        "to pay is less than fee amount"
+                    );
+                    toPay -= feeAmount;
+                    rewardToken.safeTransfer(feeRecipient, feeAmount);
+                    emit HarvestFee(_user, feeAmount, address(rewardToken));
+                }
+                rewardToken.safeTransfer(_user, toPay);
+                emit Harvest(_user, toPay, address(rewardToken));
             }
         }
     }
@@ -652,6 +796,14 @@ contract DgridStakePool is
         updatePool(); //first update accPerShares
         paused = false;
         emit Unpause(msg.sender, false);
+    }
+
+    function setFeeRecipient(
+        address _feeRecipient,
+        uint256 _feeAmount
+    ) external onlyOwner {
+        feeRecipient = _feeRecipient;
+        feeAmount = _feeAmount;
     }
 
     function emergencyWithdraw(
@@ -975,6 +1127,22 @@ contract DgridStakePool is
         return pending + plus - minus;
     }
 
+    function getDgaiAvailable(address _user) public view returns (uint256) {
+        (, uint256[] memory pendingRewards, , , , ) = this.rewardInfo(_user);
+        return pendingRewards[dgaiRewardIndex];
+    }
+
+    function isPreClaimAndStake(
+        uint8 _cid,
+        string memory _uid
+    ) public view returns (bool) {
+        return preInitialized[_cid][_uid];
+    }
+
+    function checkPreStaked(address _user) public view returns (uint8) {
+        return preStaked[_user];
+    }
+
     /**
      * @notice Transfers internal TDGAI balance to `_to`.
      * @dev If `_to` supports `ITdgaiTransferReceiver` via ERC165, this function
@@ -983,65 +1151,66 @@ contract DgridStakePool is
      *      unintended reverts. Do not unconditionally trust `_data`; receiver
      *      contracts must decode/validate it before use.
      */
-    function transferTdgai(
-        address _to,
-        uint256 _amount,
-        bytes calldata _data
-    ) external whenNotPaused nonReentrant {
-        require(_to != address(0), "to is zero address");
-        require(_to != msg.sender, "to is same as sender");
-        require(_amount > 0, "amount is zero");
-        updatePool();
-        _ensureUserInfoLen(msg.sender);
-        _accrueUnpaid(msg.sender);
-        _resetDebt(msg.sender);
-        uint256 currentBalance = getTdgaiAvailable(msg.sender);
-        require(currentBalance >= _amount, "insufficient tdgai balance");
-        tdgaiTransferIn[_to] += _amount; // transfer in to to
-        tdgaiTransferOut[msg.sender] += _amount; // transfer out from msg.sender
-        if (_supportsTdgaiTransferReceiver(_to)) {
-            _checkOnTdgaiTransfer(_to, msg.sender, _amount, _data);
-        }
-        emit TransferTdgai(msg.sender, _to, _amount);
-    }
+    // function transferTdgai(
+    //     address _to,
+    //     uint256 _amount,
+    //     bytes calldata _data
+    // ) external whenNotPaused nonReentrant {
+    //     require(_to != address(0), "to is zero address");
+    //     require(_to != msg.sender, "to is same as sender");
+    //     require(_amount > 0, "amount is zero");
+    //     updatePool();
+    //     _ensureUserInfoLen(msg.sender);
+    //     _accrueUnpaid(msg.sender);
+    //     _resetDebt(msg.sender);
+    //     uint256 currentBalance = getTdgaiAvailable(msg.sender);
+    //     require(currentBalance >= _amount, "insufficient tdgai balance");
+    //     tdgaiTransferIn[_to] += _amount; // transfer in to to
+    //     tdgaiTransferOut[msg.sender] += _amount; // transfer out from msg.sender
+    //     if (_supportsTdgaiTransferReceiver(_to)) {
+    //         _checkOnTdgaiTransfer(_to, msg.sender, _amount, _data);
+    //     }
+    //     emit TransferTdgai(msg.sender, _to, _amount);
+    // }
 
-    function batchTransferTdgai(
-        address[] calldata _tos,
-        uint256[] calldata _amounts
-    ) external whenNotPaused nonReentrant {
-        uint256 len = _tos.length;
-        require(len == _amounts.length, "length mismatch");
-        require(len > 0, "empty batch");
+    /// @notice The tos must be an EOA address; if it's a contract address, it will be lost.
+    // function batchTransferTdgai(
+    //     address[] calldata _tos,
+    //     uint256[] calldata _amounts
+    // ) external whenNotPaused nonReentrant {
+    //     uint256 len = _tos.length;
+    //     require(len == _amounts.length, "length mismatch");
+    //     require(len > 0, "empty batch");
 
-        updatePool();
-        _ensureUserInfoLen(msg.sender);
-        _accrueUnpaid(msg.sender);
-        _resetDebt(msg.sender);
+    //     updatePool();
+    //     _ensureUserInfoLen(msg.sender);
+    //     _accrueUnpaid(msg.sender);
+    //     _resetDebt(msg.sender);
 
-        uint256 totalAmount = 0;
+    //     uint256 totalAmount = 0;
 
-        for (uint256 i = 0; i < len; ) {
-            address to = _tos[i];
-            uint256 amount = _amounts[i];
+    //     for (uint256 i = 0; i < len; ) {
+    //         address to = _tos[i];
+    //         uint256 amount = _amounts[i];
 
-            require(to != address(0), "to is zero address");
-            require(to != msg.sender, "to is same as sender");
-            require(amount > 0, "amount is zero");
+    //         require(to != address(0), "to is zero address");
+    //         require(to != msg.sender, "to is same as sender");
+    //         require(amount > 0, "amount is zero");
 
-            tdgaiTransferIn[to] += amount;
-            emit TransferTdgai(msg.sender, to, amount);
-            totalAmount += amount;
+    //         tdgaiTransferIn[to] += amount;
+    //         emit TransferTdgai(msg.sender, to, amount);
+    //         totalAmount += amount;
 
-            unchecked {
-                ++i;
-            }
-        }
+    //         unchecked {
+    //             ++i;
+    //         }
+    //     }
 
-        uint256 currentBalance = getTdgaiAvailable(msg.sender);
-        require(currentBalance >= totalAmount, "insufficient tdgai balance");
+    //     uint256 currentBalance = getTdgaiAvailable(msg.sender);
+    //     require(currentBalance >= totalAmount, "insufficient tdgai balance");
 
-        tdgaiTransferOut[msg.sender] += totalAmount;
-    }
+    //     tdgaiTransferOut[msg.sender] += totalAmount;
+    // }
 
     function _checkOnTdgaiTransfer(
         address _to,
