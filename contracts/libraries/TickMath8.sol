@@ -61,8 +61,13 @@ library TickMath {
             if (tick > 0) ratio = type(uint256).max / ratio;
 
             // Q128 -> Q96
+            // sqrtPriceX96 = uint160(
+            //     (ratio + 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF) >> 32
+            // );
+
+            // Q128.128 -> Q64.96，
             sqrtPriceX96 = uint160(
-                (ratio + 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF) >> 32
+                (ratio >> 32) + (ratio % 0x100000000 == 0 ? 0 : 1)
             );
             require(
                 sqrtPriceX96 >= MIN_SQRT_RATIO &&
