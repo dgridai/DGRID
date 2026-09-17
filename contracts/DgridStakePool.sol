@@ -378,6 +378,7 @@ contract DgridStakePool is
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
             abi.encode(
                 block.chainid,
+                address(this),
                 _nodes,
                 _staker,
                 _expireTime,
@@ -485,6 +486,7 @@ contract DgridStakePool is
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
             abi.encode(
                 block.chainid,
+                address(this),
                 _nodeIds,
                 _owner,
                 _expireTime,
