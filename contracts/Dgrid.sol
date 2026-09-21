@@ -162,7 +162,9 @@ contract Dgrid is
                 user,
                 parent,
                 nodeCount,
-                expireTime
+                expireTime,
+                nodePrice,
+                gasAmountPerNode
             )
         );
         // recover the signer address from the signature
