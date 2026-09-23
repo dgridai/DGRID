@@ -1,113 +1,120 @@
-## DGRID Project Documentation (English)
+## DGRID Project Documentation
 
 ### Overview
 
-A decentralized smart AI network built on BNB Smart Chain (BSC) and compatible with other EVM networks.
+DGRID is a decentralized smart AI network built on BNB Smart Chain (BSC) and other EVM-compatible networks.
 
-- Multi-asset payment (native token or ERC-20) via Chainlink price conversion
-- Automated referral commissions
-- Per-order pricing and configurable lock-amount per node
-- Transfer-gated NFTs, plus a staking pool with multi-reward support
+The current contracts cover:
 
-Core contracts:
+- USDT-based node NFT purchases with server-signed orders
+- Referral commission accounting
+- Transfer-gated node NFTs with staking and jail states
+- Node NFT staking with multi-token rewards
+- DGAI staking by node and lock tier
+- User top-ups with BNB, stablecoins, or configured tDGAI
+- tDGAI TWAP pricing through PancakeSwap V3
+- AI Arena winner upload and reward claiming
 
-- `contracts/Dgrid.sol`: purchase, pricing, commission, minting, lock transfer, pause/emergency
-- `contracts/DgridNode.sol`: ERC-721 node NFT with transfer gating and stake/jail flags
-- `contracts/DgridStakePool.sol`: staking for node NFTs with multi reward tokens
-- `contracts/DgridLock.sol`: lock vault receiving the locked portion of payments
-- `contracts/ChainlinkPriceFeed.sol`: oracle adapter (cache, heartbeat, deviation guard)
+### Contracts
+
+- `contracts/Dgrid.sol`: USDT node purchase, referral commission, node NFT minting, pause and emergency controls
+- `contracts/DgridNode.sol`: ERC-721 node NFT with public-transfer gating and staked/jailed flags
+- `contracts/DgridStakePool.sol`: node NFT staking, reward harvesting, tDGAI accounting, pre-claim flow, and DGAI reward restaking
+- `contracts/DGAIStaking.sol`: DGAI staking by node and lock tier, unstake cooling, reward claiming, node commission, and jail controls
+- `contracts/DgridTopUp.sol`: user top-ups paid with BNB, supported stablecoins, or configured tDGAI
+- `contracts/DgridPriceFeed.sol`: PancakeSwap V3 TWAP adapter for tDGAI pricing
+- `contracts/ChainlinkPriceFeed.sol`: Chainlink price adapter with cache, heartbeat, deviation guard, and 18-decimal scaling
+- `contracts/DgridAIArena.sol`: user activation, server-uploaded winners, and multi-token reward claims
+- `contracts/DGAI.sol`: capped mintable DGAI ERC-20
+- `contracts/Proxy.sol`: OpenZeppelin transparent proxy imports for deployment
 
 ### Roles
 
-- Owner: config/admin (prices, feeds, assets, params, pause)
-- Server: authorized signer for orders and staking operations
-- Dev: receives net payment after commission and lock
-- DgridLock Operator: withdraws locked funds per policy
-- User: purchaser and/or recipient; Referrer (parent) accrues commission
+- Owner: configures protocol parameters, assets, rewards, oracles, pause state, and emergency operations
+- Server: signs or operates purchase orders, staking actions, pre-stake validation, jail/unjail actions, and AI Arena winners
+- Dev: receives node purchase proceeds and top-up funds
+- Treasury: source wallet for server-authorized DGAI pre-stake transfers
+- User: buys nodes, stakes NFTs or DGAI, tops up, joins AI Arena, and claims rewards
+- Referrer: receives node purchase commission
 
-### Key Features
+### Main Flows
 
-- Server-signed order: `(chainId, orderId, user, parent, nodeCount, expireTime)` with EIP-191 signature
-- Pricing and lock:
-  - `nodePrice`: price per node in 18 decimals
-  - `lockAmountPerNode`: lock portion per node in 18 decimals
-  - `calculatePaymentAmount(nodeCount)` = `nodePrice * nodeCount * 1e18`
-  - `calculateLockAmount(nodeCount)` = `lockAmountPerNode * nodeCount * 1e18`
-- Commission: `(paidAmount * commissionRate) / 100` credited to `commission[parent][asset]`
-- Payments:
-  - Native: convert with `fetchPrice(address(0))`; refund excess `msg.value`
-  - ERC-20: allowance check + `safeTransferFrom`, using token decimals
-- Lock routing: lock portion → `dgridLock`; net proceeds → `dev`
-- ERC-721 minting: mints sequential `NODE_ID` to `user`; transfers disabled by default
-- Staking pool: stake/unstake with per-block multi-token rewards; server-signed deposit; jail/unjail controls
+#### Node Purchase (`Dgrid`)
 
-### Purchase Flow
+- `buyNode(...)` currently supports purchases with the configured `usdt` token only.
+- Server signature includes `chainId`, `address(this)`, `usdt`, order data, `nodePrice`, and `gasAmountPerNode`.
+- Payment amount is:
 
-1. Off-chain: `server` signs payload `abi.encode(chainId, orderId, user, parent, nodeCount, expireTime)` and EIP-191 wrap.
-2. On-chain: call `buyNode(orderId, user, parent, nodeCount, expireTime, signature, asset)`:
-   - Validates signature, `expireTime`, asset allowlist, and unique `orderId`
-   - Computes payment + lock, converts via `ChainlinkPriceFeed.fetchPrice`
-   - Handles commission, lock transfer to `dgridLock`, net to `dev`, refund (if native)
-   - Mints `nodeCount` NFTs to `user`
-   - Emits `Locked` and `BuyNode`
+```solidity
+nodePrice * nodeCount * 1e18 + gasAmountPerNode * nodeCount * 1e18
+```
 
-### Staking Flow (DgridStakePool)
+- Referral commission is calculated from the node-price portion only.
+- The net amount is transferred to `dev`; commission stays claimable for the referrer.
+- Node NFTs are minted sequentially to the target user.
 
-- Server-signed deposit: `abi.encode(chainId, nodeIds, staker, expireTime)`
-- `deposit(nodeIds, staker, expireTime, signature)`: stakes NFTs, updates rewards accrual
-- Rewards:
-  - Multiple `rewardToken` entries with `rewardPerBlock`
-  - `pendingRewards(user)` and `harvest()` to claim
-- Moderation:
-  - `jailNodes([{owner, tokenIds}, ...])` by `server` reduces stake and marks jailed
-  - `unjailNodes(nodeIds, owner)` restores stake after checks
-- Pausable; emergency withdraw for reward tokens when paused
+#### Node NFT Staking (`DgridStakePool`)
 
-### Oracle and Safety (ChainlinkPriceFeed)
+- Users stake owned `DgridNode` NFTs with a server-signed `deposit(...)`.
+- Rewards accrue per block across configured reward tokens.
+- Users can `harvest()` available rewards.
+- Unstake is controlled by `unstakeEnabled`.
+- Server can jail nodes; users can unjail with a server signature.
+- DGAI rewards can be restaked into `DGAIStaking`.
 
-- Per-block caching of price; staleness guard via `heartbeat`
-- Deviation guard vs last cached price (`MAX_PRICE_DEVIATION`, default 50%)
-- All prices scaled to 18 decimals
-- Requires configuring feed for native via `asset == address(0)`
+#### DGAI Staking (`DGAIStaking`)
 
-### Admin and Configuration
+- Owner creates staking nodes.
+- Users stake DGAI into a selected node and lock tier.
+- Lock tiers use configurable fixed rates for reward weight.
+- Users can claim rewards, restake rewards, change nodes, and request unstake.
+- Unstaked principal is released after the lock-tier cooling period.
+- Node owners can claim node commission.
+- Emergency withdrawal is limited to surplus DGAI above user principal.
 
-- `Dgrid.sol`
-  - `initialize(owner, server, dev, priceFeed, dgridNodeProxy, commissionRate, assets, nodePrice, dgridLock, lockAmountPerNode)`
-  - `setCommissionRate(uint256<=100)`, `setServer(address)`, `setDev(address)`
-  - `setPriceFeed(address)`, `setAssets(address[])`, `setNodePrice(uint256)`, `setLockAmountPerNode(uint256)`, `setDgridLock(address)`
-  - `pause()`, `unpause()`, `emergencyWithdraw(address to)` when paused
-- `DgridNode.sol`
-  - `setPublicTransferEnabled(bool)`, `setDgrid(address)`, `setDgridStakePool(address)`
-  - Transfers revert if disabled or if token is staked/jailed
-- `DgridStakePool.sol`
-  - `addRewardToken(token, perBlock)`, `setRewardPerBlock([...])`, `setRewardTokenEnabled(index, enabled)`
-  - `setStartBlock(uint256)`, `setServer(address)`, `pause()`, `unpause()`, `emergencyWithdraw(address to)`
-- `ChainlinkPriceFeed.sol`
-  - `setPriceFeed(asset, aggregator)`, `setHeartbeat(uint32)`, `setMaxPriceDeviation(uint256)`
+#### Top-Up (`DgridTopUp`)
 
-### Events (selected)
+- BNB top-ups use `ChainlinkPriceFeed.fetchPrice(address(0))`.
+- Stablecoin top-ups are normalized by token decimals.
+- tDGAI top-ups use `DgridPriceFeed.getTDGAITwapPrice18()`.
+- `userTopUpAmount[user]` stores cumulative 18-decimal USD value.
 
-- Dgrid: `BuyNode`, `Locked`, `ClaimCommission`, `Pause`, `Unpause`, `EmergencyWithdraw`
-- DgridNode: `Mint`, `Stake`, `Unstake`, `Jail`, `Unjail`
-- DgridStakePool: `Deposit`, `JailNodes`, `UnjailNodes`, `Harvest`, `Update*`, `Pause`, `Unpause`, `EmergencyWithdraw`
+#### AI Arena (`DgridAIArena`)
+
+- Users call `activate()` once before receiving rewards.
+- Server uploads winners by round with supported reward tokens.
+- Users claim rewards with `claimReward()`.
+- `getShortfall(token)` reports reward-token funding gaps.
+
+### Pricing
+
+- `ChainlinkPriceFeed` handles external asset prices such as BNB.
+- `DgridPriceFeed` reads PancakeSwap V3 observations to calculate tDGAI TWAP.
+- Prices are returned in 18 decimals.
+
+### Admin Notes
+
+- Call `Dgrid.initializeV2(usdt)` before node purchases.
+- Configure the native BNB Chainlink feed as `asset == address(0)` before BNB top-ups.
+- Configure `DgridTopUp.setTDGAI(...)` and `setTDGridPriceFeed(...)` before tDGAI top-ups.
+- `DGAIStaking` starts paused after initialization and must be unpaused before user staking.
+- `DgridNode` transfers are blocked while public transfers are disabled, or while a token is staked or jailed.
+- Anyone can call `Dgrid.claimCommission(user, assets[])`; funds are sent to `user`.
 
 ### Development
 
-- Install
+Install dependencies:
 
 ```bash
 npm install
 ```
 
-- Compile
+Compile:
 
 ```bash
 npx hardhat compile
 ```
 
-### Notes
+### Audit
 
-- Anyone can call `claimCommission(_user, assets[])`; funds are transferred to `_user` and balances zeroed.
-- Ensure native price feed (`address(0)`) configured before enabling native purchases.
-- Audit: see `audits/Metatrust_Dgrid.pdf`.
+See `audits/**.pdf`.
