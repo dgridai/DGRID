@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {
-    SafeERC20
-} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {
-    OwnableUpgradeable
-} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import {
-    Initializable
-} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {
-    ReentrancyGuardUpgradeable
-} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {IDgridPriceFeed} from "./Interfaces/IDgridPriceFeed.sol";
 import {ChainlinkPriceFeed} from "./ChainlinkPriceFeed.sol";
 
@@ -127,7 +119,10 @@ contract DgridTopUp is
                     "price feed is zero address"
                 );
                 uint256 price = priceFeed.getTDGAITwapPrice18();
-                usdAmount = (amount * price) / 1e18; //usd amount
+                require(price > 0, "Invalid price");
+                usdAmount =
+                    (amount * price) /
+                    (10 ** supportedTokensInfos[token].decimals); //usd amount
             } else {
                 // pay with stablecoin
                 // is stablecoin, 1 usd = 1 stablecoin
