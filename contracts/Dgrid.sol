@@ -1,25 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
-import {
-    MessageHashUtils
-} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {ChainlinkPriceFeed} from "./ChainlinkPriceFeed.sol";
-import {
-    SafeERC20
-} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-import {
-    OwnableUpgradeable
-} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import {
-    Initializable
-} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {
-    ReentrancyGuardUpgradeable
-} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {IDgridNode} from "./Interfaces/IDgridNode.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 contract Dgrid is
     Initializable,
@@ -44,6 +35,8 @@ contract Dgrid is
     uint256 public nodePrice;
 
     bool public paused;
+
+    address public usdt; // buy node with usdt
 
     constructor() {
         _disableInitializers();
@@ -88,6 +81,7 @@ contract Dgrid is
         require(paused, "not paused");
         _;
     }
+
     function _initNodeNodeId() internal {
         NODE_ID = 1;
     }
@@ -136,17 +130,22 @@ contract Dgrid is
         gasAmountPerNode = _gasAmountPerNode;
     }
 
+    function initializeV2(address _usdt) public reinitializer(2) {
+        require(_usdt != address(0), "usdt is zero address");
+        require(assetInfos[_usdt].token != address(0), "usdt is not asset");
+        usdt = _usdt;
+    }
+
+    ///@notice buy node only with usdt
     function buyNode(
         uint256 orderId,
         address user,
         address parent,
         uint256 nodeCount,
         uint256 expireTime,
-        bytes calldata signature,
-        address asset
+        bytes calldata signature
     ) public nonReentrant whenNotPaused {
         require(!fulfilledOrders[orderId], "Order already fulfilled");
-        require(assetInfos[asset].token != address(0), "Invalid asset");
         require(
             expireTime > block.timestamp,
             "ExpirationTime must be greater than current timestamp"
@@ -157,11 +156,15 @@ contract Dgrid is
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(
             abi.encode(
                 block.chainid,
+                address(this),
+                usdt,
                 orderId,
                 user,
                 parent,
                 nodeCount,
-                expireTime
+                expireTime,
+                nodePrice,
+                gasAmountPerNode
             )
         );
         // recover the signer address from the signature
@@ -174,13 +177,13 @@ contract Dgrid is
         uint256 payValue = 0;
         uint256 commissionAmount;
 
-        // pay with erc20 asset
+        // pay with erc20 usdt asset
         uint256 paymentAmountInAsset = (paymentAmount *
-            (10 ** assetInfos[asset].decimals)) / 1e18;
+            (10 ** assetInfos[usdt].decimals)) / 1e18;
         uint256 gasAmountInAsset = (gasAmount *
-            (10 ** assetInfos[asset].decimals)) / 1e18;
+            (10 ** assetInfos[usdt].decimals)) / 1e18;
         uint256 totalAmountInAsset = paymentAmountInAsset + gasAmountInAsset;
-        uint256 allowance = ERC20(asset).allowance(msg.sender, address(this));
+        uint256 allowance = ERC20(usdt).allowance(msg.sender, address(this));
         require(
             allowance >= totalAmountInAsset,
             "Buy Node: Insufficient allowance"
@@ -188,11 +191,11 @@ contract Dgrid is
         payValue = totalAmountInAsset;
         if (parent != address(0)) {
             commissionAmount = (paymentAmountInAsset * commissionRate) / 100;
-            commission[parent][asset] += commissionAmount;
+            commission[parent][usdt] += commissionAmount;
         }
-        _safeTransferFrom(asset, msg.sender, address(this), totalAmountInAsset);
+        _safeTransferFrom(usdt, msg.sender, address(this), totalAmountInAsset);
         //transfer asset to dev
-        _safeTransfer(asset, dev, totalAmountInAsset - commissionAmount);
+        _safeTransfer(usdt, dev, totalAmountInAsset - commissionAmount);
 
         uint256[] memory nodeIds = new uint256[](nodeCount);
         for (uint256 i = 0; i < nodeCount; i++) {
@@ -207,7 +210,7 @@ contract Dgrid is
             user,
             parent,
             nodeCount,
-            asset,
+            usdt,
             payValue,
             commissionAmount,
             nodeIds

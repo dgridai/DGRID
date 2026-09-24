@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {
-    SafeERC20
-} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {
-    OwnableUpgradeable
-} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import {
-    Initializable
-} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {
-    ReentrancyGuardUpgradeable
-} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {IDgridPriceFeed} from "./Interfaces/IDgridPriceFeed.sol";
 import {ChainlinkPriceFeed} from "./ChainlinkPriceFeed.sol";
 
@@ -26,7 +18,7 @@ contract DgridTopUp is
     address public dev;
     bool public paused;
 
-    address public tDGAI;
+    address public tDGAI; /// @dev deprecated
     IDgridPriceFeed public priceFeed;
     ChainlinkPriceFeed public chainLinkPriceFeed;
 
@@ -39,6 +31,7 @@ contract DgridTopUp is
         uint8 decimals;
     }
 
+    address public DGAI; /// @dev upgradeV2
     event TopUp(
         address indexed user,
         address indexed token,
@@ -97,6 +90,27 @@ contract DgridTopUp is
         }
     }
 
+    function initializeV2(
+        address _DGAI,
+        address _priceFeed
+    ) external reinitializer(2) {
+        require(_DGAI != address(0), "DGAI is zero address");
+        require(_priceFeed != address(0), "price feed is zero address");
+
+        DGAI = _DGAI;
+
+        if (supportedTokensInfos[DGAI].token == address(0)) {
+            supportedTokensInfos[DGAI] = Asset({
+                token: DGAI,
+                decimals: ERC20(DGAI).decimals()
+            });
+            supportedTokens.push(DGAI);
+        }
+
+        priceFeed = IDgridPriceFeed(_priceFeed);
+        emit SetPriceFeed(_priceFeed);
+    }
+
     function topUp(
         address user,
         address token,
@@ -120,14 +134,17 @@ contract DgridTopUp is
                 supportedTokensInfos[token].token != address(0),
                 "token not supported"
             );
-            // pay with tDGAI
-            if (token == tDGAI) {
+            // pay with DGAI
+            if (token == DGAI) {
                 require(
                     address(priceFeed) != address(0),
                     "price feed is zero address"
                 );
-                uint256 price = priceFeed.getTDGAITwapPrice18();
-                usdAmount = (amount * price) / 1e18; //usd amount
+                uint256 price = priceFeed.getDGAITwapPrice18();
+                require(price > 0, "Invalid price");
+                usdAmount =
+                    (amount * price) /
+                    (10 ** supportedTokensInfos[token].decimals);
             } else {
                 // pay with stablecoin
                 // is stablecoin, 1 usd = 1 stablecoin
@@ -208,7 +225,7 @@ contract DgridTopUp is
         emit SetTDGAI(_tDGAI);
     }
 
-    function setTDGridPriceFeed(address _priceFeed) public onlyOwner {
+    function setDGridPriceFeed(address _priceFeed) public onlyOwner {
         require(_priceFeed != address(0), "Invalid price feed");
         priceFeed = IDgridPriceFeed(_priceFeed);
         emit SetPriceFeed(_priceFeed);
@@ -249,28 +266,5 @@ contract DgridTopUp is
             }
         }
         emit EmergencyWithdraw(to, tokens, amounts);
-    }
-
-    function deleteSupportedToken(address token) external onlyOwner {
-        require(token != address(0), "Invalid token");
-        require(
-            supportedTokensInfos[token].token != address(0),
-            "Token not supported"
-        );
-
-        // 1) delete mapping (disables topUp check)
-        delete supportedTokensInfos[token];
-
-        // 2) remove from array (swap & pop)
-        uint256 len = supportedTokens.length;
-        for (uint256 i = 0; i < len; i++) {
-            if (supportedTokens[i] == token) {
-                if (i != len - 1) {
-                    supportedTokens[i] = supportedTokens[len - 1];
-                }
-                supportedTokens.pop();
-                break;
-            }
-        }
     }
 }
