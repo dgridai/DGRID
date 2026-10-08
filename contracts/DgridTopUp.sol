@@ -140,11 +140,11 @@ contract DgridTopUp is
                     address(priceFeed) != address(0),
                     "price feed is zero address"
                 );
-                uint256 price = priceFeed.getDGAITwapPrice18();
+                uint256 price = priceFeed.getTDGAITwapPrice18();
                 require(price > 0, "Invalid price");
                 usdAmount =
                     (amount * price) /
-                    (10 ** supportedTokensInfos[token].decimals);
+                    (10 ** supportedTokensInfos[token].decimals); //usd amount
             } else {
                 // pay with stablecoin
                 // is stablecoin, 1 usd = 1 stablecoin

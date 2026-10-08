@@ -306,6 +306,7 @@ contract DGAIStaking is
         address _dev
     ) external initializer {
         require(_DGAI != address(0), "DGAI is zero");
+        /// @dev owner is safe address
         require(_owner != address(0), "owner is zero");
         require(_server != address(0), "server is zero");
         require(_dev != address(0), "dev is zero");
@@ -343,45 +344,12 @@ contract DGAIStaking is
             accRewardPerShares.push(0);
             remainders.push(0);
         }
-        for (uint256 i = 0; i < _days.length; i++) {
-            fixedRates[_days[i]] = _fixedRates[i];
-        }
-
-        paused = true;
     }
 
-    function initializeV2(
-        uint64 _claimStartInitTime
-    ) external reinitializer(2) {
-        require(_claimStartInitTime > 0, "claim start init time is zero");
-        claimStartInitTime = _claimStartInitTime;
-    }
-
-    function initializeV3(address _stakePool) external reinitializer(3) {
-        require(_stakePool != address(0), "stake pool is zero");
-        stakePool = _stakePool;
-    }
-
-    function createStakingNodeByOwner(
-        address _nodeOwner
-    ) external nonReentrant whenNotPaused onlyOwner {
-        require(_nodeOwner != address(0), "node owner is zero");
-
-        updateNodePool();
-        nodeIds++;
-        // init dgrid node
-        StakingNode storage node = stakingNodeMap[nodeIds];
-        node.nodeStatus = 1; // active staking
-        node.amount = 0;
-        node.nodeId = nodeIds;
-        node.owner = _nodeOwner;
-
-        emit CreateStakingNode(_nodeOwner, nodeIds);
-    }
-
-    function handlePreStake(
-        uint64 _day,
-        uint64 _nodeId,
+    /// @notice Create a new staking node for server signature.
+    function createStakingNode(
+        string memory _nodeName,
+        address _staker,
         uint256 _amount,
         uint256 _deadline,
         uint256 _nonce,

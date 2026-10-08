@@ -5,7 +5,9 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 interface AggregatorV3Interface {
     function decimals() external view returns (uint8);
+
     function description() external view returns (string memory);
+
     function version() external view returns (uint256);
 
     function getRoundData(
@@ -89,8 +91,11 @@ contract ChainlinkPriceFeed is Ownable {
         if (block.timestamp - updatedAt > heartbeat) revert PriceFeed__Stale();
 
         uint256 scaledPrice = _scalePrice(uint256(answer), feedDecimals[asset]);
-        // price deviation check (optional, enable as needed)
-        if (lastPrice[asset] != 0 && lastRoundId[asset] != 0) {
+        bool hasRecentCachedPrice = lastPrice[asset] != 0 &&
+            lastRoundId[asset] != 0 &&
+            block.timestamp - lastTimestamp[asset] <= heartbeat;
+
+        if (hasRecentCachedPrice) {
             uint256 minP = scaledPrice < lastPrice[asset]
                 ? scaledPrice
                 : lastPrice[asset];
