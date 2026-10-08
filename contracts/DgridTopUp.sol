@@ -140,7 +140,7 @@ contract DgridTopUp is
                     address(priceFeed) != address(0),
                     "price feed is zero address"
                 );
-                uint256 price = priceFeed.getTDGAITwapPrice18();
+                uint256 price = priceFeed.getDGAITwapPrice18();
                 require(price > 0, "Invalid price");
                 usdAmount =
                     (amount * price) /

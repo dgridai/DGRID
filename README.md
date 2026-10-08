@@ -11,18 +11,18 @@ The current contracts cover:
 - Transfer-gated node NFTs with staking and jail states
 - Node NFT staking with multi-token rewards
 - DGAI staking by node and lock tier
-- User top-ups with BNB, stablecoins, or configured tDGAI
-- tDGAI TWAP pricing through PancakeSwap V3
+- User top-ups with BNB, stablecoins, or configured DGAI
+- DGAI/USDT TWAP pricing through PancakeSwap V3
 - AI Arena winner upload and reward claiming
 
 ### Contracts
 
 - `contracts/Dgrid.sol`: USDT node purchase, referral commission, node NFT minting, pause and emergency controls
 - `contracts/DgridNode.sol`: ERC-721 node NFT with public-transfer gating and staked/jailed flags
-- `contracts/DgridStakePool.sol`: node NFT staking, reward harvesting, tDGAI accounting, pre-claim flow, and DGAI reward restaking
+- `contracts/DgridStakePool.sol`: node NFT staking, reward harvesting, DGAI accounting, pre-claim flow, and DGAI reward restaking
 - `contracts/DGAIStaking.sol`: DGAI staking by node and lock tier, unstake cooling, reward claiming, node commission, and jail controls
-- `contracts/DgridTopUp.sol`: user top-ups paid with BNB, supported stablecoins, or configured tDGAI
-- `contracts/DgridPriceFeed.sol`: PancakeSwap V3 TWAP adapter for tDGAI pricing
+- `contracts/DgridTopUp.sol`: user top-ups paid with BNB, supported stablecoins, or configured DGAI
+- `contracts/DgridPriceFeed.sol`: PancakeSwap V3 TWAP adapter for DGAI/USDT pricing
 - `contracts/ChainlinkPriceFeed.sol`: Chainlink price adapter with cache, heartbeat, deviation guard, and 18-decimal scaling
 - `contracts/DgridAIArena.sol`: user activation, server-uploaded winners, and multi-token reward claims
 - `contracts/DGAI.sol`: capped mintable DGAI ERC-20
@@ -76,7 +76,7 @@ nodePrice * nodeCount * 1e18 + gasAmountPerNode * nodeCount * 1e18
 
 - BNB top-ups use `ChainlinkPriceFeed.fetchPrice(address(0))`.
 - Stablecoin top-ups are normalized by token decimals.
-- tDGAI top-ups use `DgridPriceFeed.getTDGAITwapPrice18()`.
+- DGAI top-ups use `DgridPriceFeed.getDGAITwapPrice18()`.
 - `userTopUpAmount[user]` stores cumulative 18-decimal USD value.
 
 #### AI Arena (`DgridAIArena`)
@@ -89,14 +89,15 @@ nodePrice * nodeCount * 1e18 + gasAmountPerNode * nodeCount * 1e18
 ### Pricing
 
 - `ChainlinkPriceFeed` handles external asset prices such as BNB.
-- `DgridPriceFeed` reads PancakeSwap V3 observations to calculate tDGAI TWAP.
+- `DgridPriceFeed` reads PancakeSwap V3 observations to calculate the DGAI/USDT TWAP.
 - Prices are returned in 18 decimals.
 
 ### Admin Notes
 
 - Call `Dgrid.initializeV2(usdt)` before node purchases.
 - Configure the native BNB Chainlink feed as `asset == address(0)` before BNB top-ups.
-- Configure `DgridTopUp.setTDGAI(...)` and `setTDGridPriceFeed(...)` before tDGAI top-ups.
+- Call `DgridTopUp.initializeV2(DGAI, priceFeed)` before DGAI top-ups.
+- Use `DgridTopUp.setDGridPriceFeed(...)` if the DGAI price feed needs to be updated.
 - `DGAIStaking` starts paused after initialization and must be unpaused before user staking.
 - `DgridNode` transfers are blocked while public transfers are disabled, or while a token is staked or jailed.
 - Anyone can call `Dgrid.claimCommission(user, assets[])`; funds are sent to `user`.
