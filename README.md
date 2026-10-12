@@ -12,6 +12,7 @@ The current contracts cover:
 - Node NFT staking with multi-token rewards
 - DGAI staking by node and lock tier
 - User top-ups with BNB, stablecoins, or configured DGAI
+- Server-triggered automatic top-ups with supported stablecoins
 - DGAI/USDT TWAP pricing through PancakeSwap V3
 - AI Arena winner upload and reward claiming
 
@@ -22,6 +23,7 @@ The current contracts cover:
 - `contracts/DgridStakePool.sol`: node NFT staking, reward harvesting, DGAI accounting, pre-claim flow, and DGAI reward restaking
 - `contracts/DGAIStaking.sol`: DGAI staking by node and lock tier, unstake cooling, reward claiming, node commission, and jail controls
 - `contracts/DgridTopUp.sol`: user top-ups paid with BNB, supported stablecoins, or configured DGAI
+- `contracts/DgridTopUpAuto.sol`: server-triggered automatic top-ups using supported tokens
 - `contracts/DgridPriceFeed.sol`: PancakeSwap V3 TWAP adapter for DGAI/USDT pricing
 - `contracts/ChainlinkPriceFeed.sol`: Chainlink price adapter with cache, heartbeat, deviation guard, and 18-decimal scaling
 - `contracts/DgridAIArena.sol`: user activation, server-uploaded winners, and multi-token reward claims
@@ -31,7 +33,7 @@ The current contracts cover:
 ### Roles
 
 - Owner: configures protocol parameters, assets, rewards, oracles, pause state, and emergency operations
-- Server: signs or operates purchase orders, staking actions, pre-stake validation, jail/unjail actions, and AI Arena winners
+- Server: signs or operates purchase orders, staking actions, pre-stake validation, jail/unjail actions, AI Arena winners, and automatic top-ups
 - Dev: receives node purchase proceeds and top-up funds
 - Treasury: source wallet for server-authorized DGAI pre-stake transfers
 - User: buys nodes, stakes NFTs or DGAI, tops up, joins AI Arena, and claims rewards
@@ -72,11 +74,12 @@ nodePrice * nodeCount * 1e18 + gasAmountPerNode * nodeCount * 1e18
 - Node owners can claim node commission.
 - Emergency withdrawal is limited to surplus DGAI above user principal.
 
-#### Top-Up (`DgridTopUp`)
+#### Top-Up (`DgridTopUp` / `DgridTopUpAuto`)
 
 - BNB top-ups use `ChainlinkPriceFeed.fetchPrice(address(0))`.
 - Stablecoin top-ups are normalized by token decimals.
 - DGAI top-ups use `DgridPriceFeed.getDGAITwapPrice18()`.
+- `DgridTopUpAuto.autoTopUp(...)` can only be called by `server`; it transfers supported tokens from the user to `dev` and records the normalized USD value.
 - `userTopUpAmount[user]` stores cumulative 18-decimal USD value.
 
 #### AI Arena (`DgridAIArena`)
@@ -98,6 +101,7 @@ nodePrice * nodeCount * 1e18 + gasAmountPerNode * nodeCount * 1e18
 - Configure the native BNB Chainlink feed as `asset == address(0)` before BNB top-ups.
 - Call `DgridTopUp.initializeV2(DGAI, priceFeed)` before DGAI top-ups.
 - Use `DgridTopUp.setDGridPriceFeed(...)` if the DGAI price feed needs to be updated.
+- Configure `DgridTopUpAuto.initialize(owner, dev, server, usdt)` before automatic top-ups.
 - `DGAIStaking` starts paused after initialization and must be unpaused before user staking.
 - `DgridNode` transfers are blocked while public transfers are disabled, or while a token is staked or jailed.
 - Anyone can call `Dgrid.claimCommission(user, assets[])`; funds are sent to `user`.
