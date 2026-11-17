@@ -6,7 +6,6 @@ import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Own
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {SignatureValidator} from "./libraries/SignatureValidator.sol";
 
 contract DGAIStaking is
@@ -16,10 +15,10 @@ contract DGAIStaking is
 {
     using SafeERC20 for ERC20;
 
-    uint256 public constant ACC_PRECISION = 1e18;
+    uint256 private constant ACC_PRECISION = 1e18;
     /// @dev  Virtual team stake used to reuse accPerShare math; this is not a real deposited amount.
     uint256 private constant TEAM_SHARE = 1e18;
-    uint256 public constant BPS_DENOMINATOR = 10000;
+    uint256 private constant BPS_DENOMINATOR = 10000;
     /// @dev Weight baseline (in bps). A stake's weight = amount * fixedRates[day] / RATE_BASE.
     ///      It is also the per-year rate the global node acc advances at under FixedRate mode.
     ///      With RATE_BASE = 6000 (60%): 180d(6000)=1x, 360d(9000)=1.5x, 90d(3000)=0.5x.
@@ -60,7 +59,7 @@ contract DGAIStaking is
     // accRewardPerShares[0] : node reward, accRewardPerShares[1] : team reward, accRewardPerShares[2] : llm reward
     uint256[] public accRewardPerShares;
     /// @dev  The unallocated remainder from the previous division in each pool (multiplied by the scale) is carried over to the next accumulation to avoid precision loss during high-frequency updates.
-    uint256[] public remainders;
+    uint256[] private remainders;
 
     /// @notice Pending unstake request released after the cooling period
     struct PendingUnstake {
@@ -85,7 +84,14 @@ contract DGAIStaking is
 
     struct PositionView {
         uint64 nodeId;
+        /// @notice Internal position key used by claim/unstake/changeNode.
+        ///         360 is the legacy 360-day/9000 tier; 3600 is the new
+        ///         360-day/8000 tier.
+        uint64 tierId;
+        /// @notice User-facing lock duration. Both tierId 360 and 3600
+        ///         are displayed as 360 days.
         uint64 day;
+        uint64 fixedRate;
         uint8 nodeStatus;
         address nodeOwner;
         uint256 pendingReward;
@@ -96,48 +102,56 @@ contract DGAIStaking is
         uint256 claimedAmount;
     }
 
+    /// @dev Per-node accounting for the new 360-day/8000 tier. The existing
+    ///      nodeWeightCache continues to hold the total weight of all tiers;
+    ///      this struct isolates the part that earns its own commission rate.
+    struct TierCommissionInfo {
+        uint256 weight;
+        uint256 rewardDebt;
+    }
+
     mapping(address => uint64[]) private userNodes;
     mapping(address => mapping(uint64 => bool)) private userNodeExists;
     /// Staking node map
     mapping(uint64 => StakingNode) public stakingNodeMap;
     /// @dev Node commission unpaid
-    mapping(uint64 => uint256) public nodeCommissionUnpaid;
-    mapping(uint64 => uint256) public nodeDelegatedRewardDebt;
+    mapping(uint64 => uint256) private nodeCommissionUnpaid;
+    mapping(uint64 => uint256) private nodeDelegatedRewardDebt;
     /// @notice pending unstake request.
     mapping(uint64 => mapping(address => mapping(uint256 => PendingUnstake)))
         public pendingUnstake;
     /// @notice Pending unstake request ids indexed by node/user/day for reward preview and claim.
     mapping(uint64 => mapping(address => mapping(uint64 => uint256[])))
-        public userPendingUnstakeIds;
+        private userPendingUnstakeIds;
     /// @notice pending claim for node owner, delegator, llm user.
-    mapping(address => uint256) public lastTimeClaimNodeOwner;
-    mapping(address => uint256) public lastTimeClaimLlm;
+    mapping(address => uint256) private lastTimeClaimNodeOwner;
+    mapping(address => uint256) private lastTimeClaimLlm;
 
-    mapping(address => uint256) public llmUserAmount;
-    mapping(address => uint256) public llmUserRewardDebt;
-    mapping(address => uint256) public llmUserUnpaid;
+    mapping(address => uint256) private llmUserAmount;
+    mapping(address => uint256) private llmUserRewardDebt;
+    mapping(address => uint256) private llmUserUnpaid;
     mapping(address => mapping(uint256 => PendingUnstake))
-        public pendingUnstakeLlm;
+        private pendingUnstakeLlm;
 
     /// @notice whether a user has pre staked
-    mapping(address => bool) public userPreStaked;
+    mapping(address => bool) private userPreStaked;
 
-    uint256 public teamRewardDebt;
-    uint256 public teamUnpaid;
+    uint256 private teamRewardDebt;
+    uint256 private teamUnpaid;
 
-    mapping(uint256 => bool) public signedNonce;
+    mapping(uint256 => bool) private signedNonce;
 
-    uint256 public unstakedNonce; // next unstaked nonce
-    uint256 public minLlmStakeAmount;
+    uint256 private unstakedNonce; // next unstaked nonce
+    uint256 private minLlmStakeAmount;
     uint64 public nodeIds;
     uint256 public nodeStakers;
 
-    uint256 public llmStakedCount;
+    uint256 private llmStakedCount;
     /// @dev Total user principal held by this contract (node + llm staked + pending unstake principal). Protected from emergencyWithdraw.
     uint256 public totalPrincipal;
     uint256 public totalNodeStake;
-    uint256 public llmCommissionRate; /// @dev the subsequent upgrade may not be zero.
-    uint256 public teamNextClaimTime; // next team reward time for a cooling days
+    uint256 private llmCommissionRate; /// @dev the subsequent upgrade may not be zero.
+    uint256 private teamNextClaimTime; // next team reward time for a cooling days
 
     uint64 public coolingTeamClaimDay;
     uint64 public coolingClaimDay; /// @notice cooling period for node owner, delegator, llm user to claim.
@@ -149,15 +163,15 @@ contract DGAIStaking is
     mapping(uint64 => uint64) public fixedRates;
     /// @notice Per-tier stake of a user under a node. Supports multiple tiers at once.
     mapping(uint64 => mapping(address => mapping(uint64 => Position)))
-        public positions;
+        private positions;
     /// @notice Lock tiers a user currently holds under a node (index for `positions`).
-    mapping(uint64 => mapping(address => uint64[])) public userDays;
+    mapping(uint64 => mapping(address => uint64[])) private userDays;
     /// @notice Whether a lock tier is currently indexed in `userDays`.
     mapping(uint64 => mapping(address => mapping(uint64 => bool)))
-        public userDayExists;
+        private userDayExists;
     /// @notice Cached total delegated weight of a node (sum over all delegators/tiers).
     ///         Used as the FixedRate-mode commission divisor; maintained incrementally.
-    mapping(uint64 => uint256) public nodeWeightCache;
+    mapping(uint64 => uint256) private nodeWeightCache;
     /// @notice The user's activity is recorded by the backend after the tdgai swap; the interaction with the hanldePreStake function transfers the information from the treasury to this contract.
     address public treasury;
     address public server;
@@ -169,6 +183,15 @@ contract DGAIStaking is
 
     /// @dev upgrade v3
     address public stakePool;
+
+    /// @dev upgrade v4
+    bytes32 private constant ACTION_CLAIM = keccak256("CLAIM");
+    bytes32 private constant ACTION_CLAIMUNSTAKE = keccak256("CLAIMUNSTAKE");
+
+    /// @dev upgrade v5
+    uint64 private constant TIER_360_RATE_8000 = 3600;
+    uint64 public tier360CommissionRate;
+    mapping(uint64 => TierCommissionInfo) private tier360CommissionInfos;
 
     event CreateStakingNode(address indexed owner, uint64 nodeId);
     event Pause(bool paused);
@@ -262,6 +285,13 @@ contract DGAIStaking is
         uint64 day,
         uint256 amount
     );
+    event CancelUnstake(
+        uint64 indexed nodeId,
+        address indexed staker,
+        uint256 indexed cancelRequestId,
+        uint64 day,
+        uint256 amount
+    );
 
     modifier whenNotPaused() {
         require(!paused, "staking is paused");
@@ -306,7 +336,6 @@ contract DGAIStaking is
         address _dev
     ) external initializer {
         require(_DGAI != address(0), "DGAI is zero");
-        /// @dev owner is safe address
         require(_owner != address(0), "owner is zero");
         require(_server != address(0), "server is zero");
         require(_dev != address(0), "dev is zero");
@@ -332,7 +361,7 @@ contract DGAIStaking is
         commissionRate = _commissionRate;
         server = _server;
         dev = _dev;
-        /// @notice the treasury is wallet address , transfer to this contract address when user interact with the handlePreStake function.
+        /// @notice the treasury is wallet address , transfer to this contract address when user interact with the Stake function.
         treasury = _treasury;
         for (uint256 i = 0; i < _poolInfos.length; i++) {
             require(_poolInfos[i].poolId == i, "pool id mismatch");
@@ -344,18 +373,57 @@ contract DGAIStaking is
             accRewardPerShares.push(0);
             remainders.push(0);
         }
+        for (uint256 i = 0; i < _days.length; i++) {
+            fixedRates[_days[i]] = _fixedRates[i];
+        }
+
+        paused = true;
     }
 
-    /// @notice Create a new staking node for server signature.
-    function createStakingNode(
-        string memory _nodeName,
-        address _staker,
+    // function initializeV2(
+    //     uint64 _claimStartInitTime
+    // ) external reinitializer(2) {
+    //     require(_claimStartInitTime > 0, "claim start init time is zero");
+    //     claimStartInitTime = _claimStartInitTime;
+    // }
+
+    // function initializeV3(address _stakePool) external reinitializer(3) {
+    //     require(_stakePool != address(0), "stake pool is zero");
+    //     stakePool = _stakePool;
+    // }
+
+    /// @notice One-time initialization for the 360-day/8000 tier.
+    /// @dev Must be called atomically through ProxyAdmin.upgradeAndCall.
+    function initializeV4() external reinitializer(4) {
+        tier360CommissionRate = 2000;
+        fixedRates[TIER_360_RATE_8000] = 8000;
+    }
+
+    function createStakingNodeByOwner(
+        address _nodeOwner
+    ) external nonReentrant whenNotPaused onlyOwner {
+        require(_nodeOwner != address(0), "node owner is zero");
+
+        updateNodePool();
+        nodeIds++;
+        // init dgrid node
+        StakingNode storage node = stakingNodeMap[nodeIds];
+        node.nodeStatus = 1; // active staking
+        node.amount = 0;
+        node.nodeId = nodeIds;
+        node.owner = _nodeOwner;
+
+        emit CreateStakingNode(_nodeOwner, nodeIds);
+    }
+
+    function handlePreStake(
+        uint64 _day,
+        uint64 _nodeId,
         uint256 _amount,
         uint256 _deadline,
         uint256 _nonce,
         bytes calldata _signature
     ) external nonReentrant whenNotPaused {
-        require(fixedRates[_day] > 0, "invalid day");
         require(_amount > 0, "amount is zero");
         require(block.timestamp <= _deadline, "signature expired");
         require(!signedNonce[_nonce], "nonce is signed");
@@ -393,7 +461,6 @@ contract DGAIStaking is
         uint64 _day,
         uint256 _amount
     ) external nodeExists(_nodeId) nonReentrant whenNotPaused {
-        require(fixedRates[_day] > 0, "invalid day");
         require(_amount > 0, "amount is zero");
         StakingNode storage node = stakingNodeMap[_nodeId];
         require(node.nodeStatus == 1, "node not staking");
@@ -419,7 +486,6 @@ contract DGAIStaking is
         nodeExists(_selectNodeId)
     {
         require(_user != address(0), "user is zero address");
-        require(fixedRates[_day] > 0, "invalid day");
         require(_amount > 0, "amount is zero");
         updateNodePool();
         _accrueUnpaid(_selectNodeId, _user);
@@ -428,8 +494,8 @@ contract DGAIStaking is
         require(node.nodeStatus == 1, "node not staking");
         DGAI.safeTransferFrom(stakePool, address(this), _amount);
 
-        _applyStake(node, _selectNodeId, _user, _day, _amount);
-        emit RestakeRewardCall(_user, _selectNodeId, _day, _amount);
+        uint64 tierId = _applyStake(node, _selectNodeId, _user, _day, _amount);
+        emit RestakeRewardCall(_user, _selectNodeId, tierId, _amount);
     }
 
     /// @dev Shared stake accounting: credits a tier position, updates node
@@ -441,22 +507,39 @@ contract DGAIStaking is
         address _user,
         uint64 _day,
         uint256 _amount
-    ) internal {
-        Position storage pos = positions[_nodeId][_user][_day];
+    ) internal returns (uint64 tierId) {
+        // The frontend keeps using the user-facing 360-day value for new
+        // deposits. Internally the new product is isolated under tier 3600,
+        // leaving all legacy 360/9000 positions untouched.
+        tierId = _stakeTierId(_day);
+        require(fixedRates[tierId] > 0, "invalid day");
+
+        Position storage pos = positions[_nodeId][_user][tierId];
         if (!userNodeExists[_user][_nodeId]) {
             userNodeExists[_user][_nodeId] = true;
             userNodes[_user].push(_nodeId);
         }
-        if (!userDayExists[_nodeId][_user][_day]) {
-            _addUserDay(_nodeId, _user, _day);
+        if (!userDayExists[_nodeId][_user][tierId]) {
+            _addUserDay(_nodeId, _user, tierId);
         }
         if (_userStakeTotal(_nodeId, _user) == 0) {
             node.delegatorCount++;
             nodeStakers++;
         }
 
-        uint256 weight = _tierWeight(_day, _amount);
+        // Apply the delta of the aggregated position weight. Rounding each
+        // deposit independently can leave the node cache one wei below the
+        // weight later removed by unstake or changeNode.
+        uint256 weight = _tierWeightDelta(
+            fixedRates[tierId],
+            pos.amount,
+            pos.amount + _amount
+        );
         pos.amount += _amount;
+        if (tierId == TIER_360_RATE_8000) {
+            require(tier360CommissionRate > 0, "tier commission not set");
+            tier360CommissionInfos[_nodeId].weight += weight;
+        }
         // first stake
         if (pos.lastClaimTime == 0) {
             pos.lastClaimTime = block.timestamp;
@@ -470,7 +553,7 @@ contract DGAIStaking is
 
         _resetDebt(_nodeId, _user);
         _resetNodeCommissionDebt(_nodeId);
-        emit Stake(_nodeId, _user, _day, _amount);
+        emit Stake(_nodeId, _user, tierId, _amount);
     }
 
     function changeNodeByUser(
@@ -506,6 +589,8 @@ contract DGAIStaking is
         uint256 totalMoveAmount = 0;
         uint256 totalFromWeight = 0;
         uint256 totalToWeight = 0;
+        uint256 tier360FromWeight = 0;
+        uint256 tier360ToWeight = 0;
 
         for (uint256 i = 0; i < _days.length; i++) {
             uint64 day = _days[i];
@@ -519,17 +604,25 @@ contract DGAIStaking is
             if (toPos.lastClaimTime == 0) {
                 toPos.lastClaimTime = block.timestamp;
             }
+            uint256 toWeight = _tierWeightDelta(
+                fixedRates[day],
+                toPos.amount,
+                toPos.amount + moveAmount
+            );
             toPos.amount += moveAmount;
 
             fromPos.amount = 0;
             fromPos.pendingUnstake = 0;
 
             uint256 fromWeight = _tierWeight(day, fromAmount);
-            uint256 toWeight = _tierWeight(day, moveAmount);
             totalFromAmount += fromAmount;
             totalMoveAmount += moveAmount;
             totalFromWeight += fromWeight;
             totalToWeight += toWeight;
+            if (day == TIER_360_RATE_8000) {
+                tier360FromWeight += fromWeight;
+                tier360ToWeight += toWeight;
+            }
 
             if (!userDayExists[_toNodeId][msg.sender][day]) {
                 _addUserDay(_toNodeId, msg.sender, day);
@@ -554,8 +647,33 @@ contract DGAIStaking is
             );
         }
 
+        // Older positions may have been cached as the sum of per-deposit
+        // rounded weights. Cap migration against each node's actual bucket so
+        // those positions remain movable without an arithmetic underflow.
+        uint256 legacyFromWeight = totalFromWeight - tier360FromWeight;
+        uint256 sourceWeight = nodeWeightCache[_fromNodeId];
+        uint256 availableTier360Weight = tier360CommissionInfos[_fromNodeId]
+            .weight;
+        if (availableTier360Weight > sourceWeight) {
+            availableTier360Weight = sourceWeight;
+        }
+        uint256 availableLegacyWeight = sourceWeight - availableTier360Weight;
+        if (tier360FromWeight > availableTier360Weight) {
+            tier360FromWeight = availableTier360Weight;
+        }
+        if (legacyFromWeight > availableLegacyWeight) {
+            legacyFromWeight = availableLegacyWeight;
+        }
+        totalFromWeight = legacyFromWeight + tier360FromWeight;
+
         nodeWeightCache[_fromNodeId] -= totalFromWeight;
         nodeWeightCache[_toNodeId] += totalToWeight;
+        if (tier360FromWeight > 0) {
+            tier360CommissionInfos[_fromNodeId].weight -= tier360FromWeight;
+        }
+        if (tier360ToWeight > 0) {
+            tier360CommissionInfos[_toNodeId].weight += tier360ToWeight;
+        }
         poolInfos[NODE_POOL_ID].totalStaked =
             poolInfos[NODE_POOL_ID].totalStaked -
             totalFromWeight +
@@ -589,7 +707,6 @@ contract DGAIStaking is
         nodeExists(_targetNodeId)
     {
         require(fixedRates[_sourceDay] > 0, "invalid source day");
-        require(fixedRates[_targetDay] > 0, "invalid stake day");
         updateNodePool();
         _accrueUnpaid(_targetNodeId, msg.sender);
         _accrueNodeCommission(_targetNodeId);
@@ -623,16 +740,67 @@ contract DGAIStaking is
         sourcePos.claimedAmount += amount;
 
         StakingNode storage targetNode = stakingNodeMap[_targetNodeId];
-        _applyStake(targetNode, _targetNodeId, msg.sender, _targetDay, amount);
+        uint64 targetTierId = _applyStake(
+            targetNode,
+            _targetNodeId,
+            msg.sender,
+            _targetDay,
+            amount
+        );
 
         emit RestakeDGAI(
             msg.sender,
             _sourceNodeId,
             _sourceDay,
             _targetNodeId,
-            _targetDay,
+            targetTierId,
             amount
         );
+    }
+
+    function cancelUnstake(
+        uint64 _nodeId,
+        uint256 _requestId
+    ) external nodeExists(_nodeId) nonReentrant whenNotPaused {
+        require(
+            stakingNodeMap[_nodeId].nodeStatus == 1,
+            "node not cancel unstake"
+        );
+
+        PendingUnstake storage req = pendingUnstake[_nodeId][msg.sender][
+            _requestId
+        ];
+        uint256 amount = req.amount;
+        require(amount > 0, "no pending unstake");
+        uint64 day = req.day;
+
+        updateNodePool();
+        _accrueUnpaid(_nodeId, msg.sender);
+        _accrueNodeCommission(_nodeId);
+
+        delete pendingUnstake[_nodeId][msg.sender][_requestId];
+        _removePendingUnstakeId(_nodeId, msg.sender, day, _requestId);
+
+        Position storage pos = positions[_nodeId][msg.sender][day];
+        pos.pendingUnstake -= amount;
+        uint256 weight = _tierWeightDelta(
+            fixedRates[day],
+            pos.amount,
+            pos.amount + amount
+        );
+        pos.amount += amount;
+
+        StakingNode storage node = stakingNodeMap[_nodeId];
+        node.amount += amount;
+        nodeWeightCache[_nodeId] += weight;
+        if (day == TIER_360_RATE_8000) {
+            tier360CommissionInfos[_nodeId].weight += weight;
+        }
+        poolInfos[NODE_POOL_ID].totalStaked += weight;
+
+        _resetDebt(_nodeId, msg.sender);
+        _resetNodeCommissionDebt(_nodeId);
+        emit CancelUnstake(_nodeId, msg.sender, _requestId, day, amount);
     }
 
     /// @dev Total active + cooling principal of a user under a node.
@@ -657,45 +825,44 @@ contract DGAIStaking is
         userDays[_nodeId][_user].push(_day);
     }
 
-    // llm user stake
-    // function stakeLlm(uint256 _amount) external nonReentrant whenNotPaused {
-    //     revert("LLM stake is disabled");
-    //     require(_amount >= minLlmStakeAmount, "amount below minimum");
-    //     updateLlmPool();
-    //     _accrueLlmUnpaid(msg.sender);
-
-    //     DGAI.safeTransferFrom(msg.sender, address(this), _amount);
-
-    //     llmUserAmount[msg.sender] += _amount;
-    //     if (llmUserAmount[msg.sender] == _amount) {
-    //         llmStakedCount++;
-    //     }
-
-    //     poolInfos[LLM_POOL_ID].totalStaked += _amount;
-
-    //     _resetLlmDebt(msg.sender);
-    //     totalPrincipal += _amount;
-    //     emit StakeLlm(msg.sender, _amount);
-    // }
-
+    /// @param _tierId Position key: 360 for the legacy tier, 3600 for the new tier.
+    ///        Both tiers have a real cooling period of 360 days.
     function unstake(
         uint64 _nodeId,
-        uint64 _day,
+        uint64 _tierId,
         uint256 _amount
     ) external nodeExists(_nodeId) nonReentrant {
         require(_amount > 0, "amount is zero");
-        Position storage pos = positions[_nodeId][msg.sender][_day];
+        Position storage pos = positions[_nodeId][msg.sender][_tierId];
         require(_amount <= pos.amount, "insufficient staked");
 
         updateNodePool();
         _accrueUnpaid(_nodeId, msg.sender);
         _accrueNodeCommission(_nodeId);
 
-        // Move principal from active to cooling: active accrual stops; waiting reward is locked on request
-        uint256 weight = _tierWeight(_day, _amount);
+        // Move principal from active to cooling: active accrual stops; waiting reward is locked on request.
+        // Compute the weight delta from the aggregated position balance. Repeated
+        // small stakes can each round down, so the delta may differ from the
+        // independently rounded weight of _amount.
+        uint256 weight = _tierWeightDelta(
+            fixedRates[_tierId],
+            pos.amount,
+            pos.amount - _amount
+        );
+        uint256 availableWeight = _tierId == TIER_360_RATE_8000
+            ? tier360CommissionInfos[_nodeId].weight
+            : nodeWeightCache[_nodeId] - tier360CommissionInfos[_nodeId].weight;
+        if (weight > availableWeight) {
+            // Legacy caches reflect per-deposit rounding. Cap the withdrawal at
+            // the bucket's actual balance to prevent underflow during upgrades.
+            weight = availableWeight;
+        }
         pos.amount -= _amount;
         pos.pendingUnstake += _amount;
         nodeWeightCache[_nodeId] -= weight;
+        if (_tierId == TIER_360_RATE_8000) {
+            tier360CommissionInfos[_nodeId].weight -= weight;
+        }
 
         StakingNode storage node = stakingNodeMap[_nodeId];
         node.amount -= _amount;
@@ -709,54 +876,31 @@ contract DGAIStaking is
         pendingUnstake[_nodeId][msg.sender][requestId] = PendingUnstake({
             amount: _amount,
             unStakeTime: block.timestamp,
-            day: _day,
-            commissionRate: commissionRate,
+            day: _tierId,
+            commissionRate: _tierId == TIER_360_RATE_8000
+                ? tier360CommissionRate
+                : commissionRate,
             claimedReward: 0,
             claimedCommission: 0
         });
-        userPendingUnstakeIds[_nodeId][msg.sender][_day].push(requestId);
+        userPendingUnstakeIds[_nodeId][msg.sender][_tierId].push(requestId);
 
         emit Unstake(
             _nodeId,
             msg.sender,
             requestId,
-            _day,
+            _tierId,
             _amount,
-            block.timestamp + (_day * 1 days)
+            block.timestamp + (uint256(_lockDays(_tierId)) * 1 days)
         );
     }
 
-    // function unstakeLlm(uint256 _amount) external nonReentrant {
-    //     require(_amount > 0, "amount is zero");
-    //     require(_amount <= llmUserAmount[msg.sender], "insufficient staked");
-
-    //     updateLlmPool();
-    //     _accrueLlmUnpaid(msg.sender);
-
-    //     llmUserAmount[msg.sender] -= _amount;
-    //     if (llmUserAmount[msg.sender] == 0 && llmStakedCount > 0) {
-    //         llmStakedCount--;
-    //     }
-    //     poolInfos[LLM_POOL_ID].totalStaked -= _amount;
-
-    //     _resetLlmDebt(msg.sender);
-
-    //     uint256 requestId = unstakedNonce++;
-    //     pendingUnstakeLlm[msg.sender][requestId] = PendingUnstake({
-    //         amount: _amount,
-    //         unStakeTime: block.timestamp,
-    //         day: 0,
-    //         commissionRate: 0,
-    //         claimedReward: 0,
-    //         claimedCommission: 0
-    //     });
-
-    //     emit UnstakeLlm(msg.sender, requestId, _amount, block.timestamp);
-    // }
-
     function claim(
         uint64 _nodeId,
-        uint64 _day
+        uint64 _day,
+        uint256 _deadline,
+        uint256 _nonce,
+        bytes calldata _signature
     ) external nodeExists(_nodeId) nonReentrant {
         Position storage pos = positions[_nodeId][msg.sender][_day];
         require(
@@ -766,7 +910,19 @@ contract DGAIStaking is
                 pos.lastClaimTime + (uint256(coolingClaimDay) * 1 days),
             "claim cooling"
         );
-
+        require(!signedNonce[_nonce], "nonce is signed");
+        SignatureValidator.validateClaim(
+            server,
+            address(this),
+            msg.sender,
+            _nodeId,
+            _day,
+            _deadline,
+            _nonce,
+            ACTION_CLAIM,
+            _signature
+        );
+        signedNonce[_nonce] = true;
         updateNodePool();
         _accruePositionUnpaid(
             _nodeId,
@@ -794,7 +950,10 @@ contract DGAIStaking is
 
     function claimUnstake(
         uint64 _nodeId,
-        uint256 _requestId
+        uint256 _requestId,
+        uint256 _deadline,
+        uint256 _nonce,
+        bytes calldata _signature
     ) external nodeExists(_nodeId) nonReentrant {
         PendingUnstake storage req = pendingUnstake[_nodeId][msg.sender][
             _requestId
@@ -803,10 +962,23 @@ contract DGAIStaking is
 
         require(amount > 0, "no pending unstake");
         require(
-            block.timestamp >= req.unStakeTime + (req.day * 1 days),
+            block.timestamp >=
+                req.unStakeTime + (uint256(_lockDays(req.day)) * 1 days),
             "cooling not finished"
         );
-
+        require(!signedNonce[_nonce], "nonce is signed");
+        SignatureValidator.validateClaimUnstake(
+            server,
+            address(this),
+            msg.sender,
+            _nodeId,
+            _requestId,
+            _deadline,
+            _nonce,
+            ACTION_CLAIMUNSTAKE,
+            _signature
+        );
+        signedNonce[_nonce] = true;
         uint64 day = req.day;
         updateNodePool();
         _accrueUnpaid(_nodeId, msg.sender);
@@ -865,110 +1037,35 @@ contract DGAIStaking is
         emit ClaimCommission(msg.sender, amount);
     }
 
-    // node jail and unjail , user can choose a node to stake
-    function jailNode(uint64 _nodeId) external whenServer nodeExists(_nodeId) {
-        StakingNode storage node = stakingNodeMap[_nodeId];
-        require(node.nodeStatus == 1, "already jailed");
+    // // resolve jailed node
+    // function jailNode(uint64 _nodeId) external whenServer nodeExists(_nodeId) {
+    //     StakingNode storage node = stakingNodeMap[_nodeId];
+    //     require(node.nodeStatus == 1, "already jailed");
 
-        updateNodePool();
-        _accrueNodeCommission(_nodeId);
+    //     updateNodePool();
+    //     _accrueNodeCommission(_nodeId);
 
-        node.nodeStatus = 0;
-        emit JailNode(_nodeId);
-    }
-
-    // resolve jailed node
-    function unjailNode(
-        uint64 _nodeId
-    ) external whenServer nodeExists(_nodeId) {
-        StakingNode storage node = stakingNodeMap[_nodeId];
-        require(node.nodeStatus == 0, "not jailed");
-
-        updateNodePool();
-        _accrueNodeCommission(_nodeId);
-
-        node.nodeStatus = 1;
-        emit UnjailedNode(_nodeId);
-    }
-
-    // function claimTeamReward(address _target) external nonReentrant {
-    //     require(msg.sender == dev, "only dev can claim");
-    //     require(_target != address(0), "target is zero");
-    //     require(block.timestamp >= teamNextClaimTime, "team claim cooling");
-
-    //     updateTeamPool();
-    //     _accrueTeamUnpaid(); /// built-in resetDebt function
-
-    //     uint256 amount = teamUnpaid;
-    //     require(
-    //         amount + totalPrincipal <= DGAI.balanceOf(address(this)),
-    //         "pool insufficient team reward"
-    //     );
-
-    //     teamUnpaid = 0;
-
-    //     teamNextClaimTime =
-    //         block.timestamp +
-    //         (uint256(coolingTeamClaimDay) * 1 days);
-
-    //     DGAI.safeTransfer(_target, amount);
-    //     emit ClaimTeamReward(_target, amount, teamNextClaimTime);
+    //     node.nodeStatus = 0;
+    //     emit JailNode(_nodeId);
     // }
 
-    // function claimLlm() external nonReentrant {
-    //     require(
-    //         block.timestamp >=
-    //             lastTimeClaimLlm[msg.sender] +
-    //                 (uint256(coolingClaimDay) * 1 days),
-    //         "claim cooling"
-    //     );
-    //     updateLlmPool();
-    //     _accrueLlmUnpaid(msg.sender);
+    // // resolve jailed node
+    // function unjailNode(
+    //     uint64 _nodeId
+    // ) external whenServer nodeExists(_nodeId) {
+    //     StakingNode storage node = stakingNodeMap[_nodeId];
+    //     require(node.nodeStatus == 0, "not jailed");
 
-    //     uint256 amount = llmUserUnpaid[msg.sender];
-    //     require(
-    //         amount + totalPrincipal <= DGAI.balanceOf(address(this)),
-    //         "pool insufficient balance"
-    //     );
+    //     updateNodePool();
+    //     _accrueNodeCommission(_nodeId);
 
-    //     llmUserUnpaid[msg.sender] = 0;
-    //     _resetLlmDebt(msg.sender);
-    //     lastTimeClaimLlm[msg.sender] = block.timestamp;
-
-    //     DGAI.safeTransfer(msg.sender, amount);
-
-    //     emit ClaimLlm(msg.sender, amount);
-    // }
-
-    // function claimUnstakeLlm(uint256 _requestId) external nonReentrant {
-    //     revert("LLM unstake claim disabled");
-    //     PendingUnstake storage req = pendingUnstakeLlm[msg.sender][_requestId];
-    //     uint256 amount = req.amount;
-
-    //     require(amount > 0, "no pending unstake");
-    //     require(
-    //         block.timestamp >= req.unStakeTime + 7 days, // 7days after unstake
-    //         "cooling not finished"
-    //     );
-
-    //     delete pendingUnstakeLlm[msg.sender][_requestId];
-    //     totalPrincipal -= amount;
-    //     DGAI.safeTransfer(msg.sender, amount);
-
-    //     emit ClaimUnstakeLlm(msg.sender, _requestId, amount);
+    //     node.nodeStatus = 1;
+    //     emit UnjailedNode(_nodeId);
     // }
 
     function updateNodePool() public {
         _updatePool(NODE_POOL_ID);
     }
-
-    // function updateTeamPool() public {
-    //     _updatePool(TEAM_POOL_ID);
-    // }
-
-    // function updateLlmPool() public {
-    //     _updatePool(LLM_POOL_ID);
-    // }
 
     function pendingReward(
         uint64 _nodeId,
@@ -1003,48 +1100,29 @@ contract DGAIStaking is
     function pendingNodeCommission(
         uint64 _nodeId
     ) external view returns (uint256) {
-        uint256 delegatedAmount = nodeWeightCache[_nodeId];
-        if (delegatedAmount == 0) {
+        if (nodeWeightCache[_nodeId] == 0) {
             return nodeCommissionUnpaid[_nodeId];
         }
 
-        uint256 accumulated = _nodeCommissionAccumulated(
-            _nodeId,
-            _previewPoolAccRewardPerShare(NODE_POOL_ID)
-        );
-        uint256 debt = nodeDelegatedRewardDebt[_nodeId];
-        uint256 gross = accumulated > debt ? accumulated - debt : 0;
-        uint256 fee = (gross * commissionRate) / BPS_DENOMINATOR;
+        uint256 acc = _previewPoolAccRewardPerShare(NODE_POOL_ID);
+        uint256 regularAccumulated = _nodeCommissionAccumulated(_nodeId, acc);
+        uint256 regularDebt = nodeDelegatedRewardDebt[_nodeId];
+        uint256 regularGross = regularAccumulated > regularDebt
+            ? regularAccumulated - regularDebt
+            : 0;
+
+        TierCommissionInfo storage tierInfo = tier360CommissionInfos[_nodeId];
+        uint256 tierAccumulated = _tier360CommissionAccumulated(_nodeId, acc);
+        uint256 tierGross = tierAccumulated > tierInfo.rewardDebt
+            ? tierAccumulated - tierInfo.rewardDebt
+            : 0;
+
+        uint256 fee = (regularGross * commissionRate) /
+            BPS_DENOMINATOR +
+            (tierGross * tier360CommissionRate) /
+            BPS_DENOMINATOR;
 
         return nodeCommissionUnpaid[_nodeId] + fee;
-    }
-
-    // function pendingLlmReward(address _user) external view returns (uint256) {
-    //     uint256 amount = llmUserAmount[_user];
-    //     uint256 pending = llmUserUnpaid[_user];
-    //     if (amount == 0) {
-    //         return pending;
-    //     }
-
-    //     uint256 accumulated = (amount *
-    //         _previewPoolAccRewardPerShare(LLM_POOL_ID)) / ACC_PRECISION;
-    //     uint256 debt = llmUserRewardDebt[_user];
-    //     uint256 gross = accumulated > debt ? accumulated - debt : 0;
-
-    //     return pending + gross;
-    // }
-
-    // function pendingTeamReward() external view returns (uint256) {
-    //     uint256 accumulated = (TEAM_SHARE *
-    //         _previewPoolAccRewardPerShare(TEAM_POOL_ID)) / ACC_PRECISION;
-    //     uint256 debt = teamRewardDebt;
-    //     uint256 gross = accumulated > debt ? accumulated - debt : 0;
-
-    //     return teamUnpaid + gross;
-    // }
-
-    function getPoolInfoLen() external view returns (uint256) {
-        return poolInfos.length;
     }
 
     function getPositions(
@@ -1065,15 +1143,17 @@ contract DGAIStaking is
             uint64[] memory days_ = userDays[nodeId][_user];
 
             for (uint256 j = 0; j < days_.length; j++) {
-                uint64 day = days_[j];
-                Position memory pos = positions[nodeId][_user][day];
+                uint64 tierId = days_[j];
+                Position memory pos = positions[nodeId][_user][tierId];
 
                 result[index] = PositionView({
                     nodeId: nodeId,
-                    day: day,
+                    tierId: tierId,
+                    day: _lockDays(tierId),
+                    fixedRate: fixedRates[tierId],
                     nodeOwner: stakingNodeMap[nodeId].owner,
                     nodeStatus: stakingNodeMap[nodeId].nodeStatus,
-                    pendingReward: pendingReward(nodeId, _user, day),
+                    pendingReward: pendingReward(nodeId, _user, tierId),
                     lastClaimTime: pos.lastClaimTime,
                     amount: pos.amount,
                     pendingUnstake: pos.pendingUnstake,
@@ -1085,11 +1165,6 @@ contract DGAIStaking is
             }
         }
     }
-
-    // function setMinLlmStakeAmount(uint256 _minAmount) external onlyOwner {
-    //     emit SetMinLlmStakeAmount(minLlmStakeAmount, _minAmount);
-    //     minLlmStakeAmount = _minAmount;
-    // }
 
     function setCoolingTeamClaimDay(
         uint64 _coolingTeamClaimDay
@@ -1115,12 +1190,6 @@ contract DGAIStaking is
         emit SetCoolingClaimDay(coolingClaimDay, _coolingClaimDay);
         coolingClaimDay = _coolingClaimDay;
     }
-
-    // function setLlmCommissionRate(uint256 _rate) external onlyOwner {
-    //     require(_rate <= BPS_DENOMINATOR, "invalid rate");
-    //     emit SetLlmCommissionRate(llmCommissionRate, _rate);
-    //     llmCommissionRate = _rate;
-    // }
 
     function setPoolPerSecondReward(
         uint8 _poolId,
@@ -1251,6 +1320,33 @@ contract DGAIStaking is
         return (_amount * uint256(fixedRates[_day])) / RATE_BASE;
     }
 
+    /// @dev Absolute change in weight between two aggregated position amounts.
+    function _tierWeightDelta(
+        uint64 _rate,
+        uint256 _amountBefore,
+        uint256 _amountAfter
+    ) internal pure returns (uint256) {
+        uint256 weightBefore = (_amountBefore * uint256(_rate)) / RATE_BASE;
+        uint256 weightAfter = (_amountAfter * uint256(_rate)) / RATE_BASE;
+        return
+            weightAfter >= weightBefore
+                ? weightAfter - weightBefore
+                : weightBefore - weightAfter;
+    }
+
+    /// @dev Resolve a user-facing duration to the tier used for new stakes.
+    ///      This conversion is intentionally used only on stake destinations;
+    ///      existing-position operations must use the exact tierId returned by
+    ///      getPositions so legacy tier 360 remains accessible.
+    function _stakeTierId(uint64 day) internal pure returns (uint64) {
+        return day == 360 ? TIER_360_RATE_8000 : day;
+    }
+
+    /// @dev Resolve an internal tierId to its actual lock duration.
+    function _lockDays(uint64 tierId) internal pure returns (uint64) {
+        return tierId == TIER_360_RATE_8000 ? 360 : tierId;
+    }
+
     /// @dev Total weight of a user under a node, summed over all active tiers.
     function _userWeight(
         uint64 _nodeId,
@@ -1270,7 +1366,8 @@ contract DGAIStaking is
     ) internal view returns (uint256 rewardUnpaid, uint256 commissionUnpaid) {
         uint256 reward = 0;
         if (_req.amount > 0) {
-            uint256 endTime = _req.unStakeTime + (uint256(_req.day) * 1 days);
+            uint256 endTime = _req.unStakeTime +
+                (uint256(_lockDays(_req.day)) * 1 days);
             uint256 rewardTime = block.timestamp < endTime
                 ? block.timestamp
                 : endTime;
@@ -1361,7 +1458,16 @@ contract DGAIStaking is
         uint64 _nodeId,
         uint256 _acc
     ) internal view returns (uint256) {
-        return (nodeWeightCache[_nodeId] * _acc) / ACC_PRECISION;
+        uint256 tierWeight = tier360CommissionInfos[_nodeId].weight;
+        uint256 regularWeight = nodeWeightCache[_nodeId] - tierWeight;
+        return (regularWeight * _acc) / ACC_PRECISION;
+    }
+
+    function _tier360CommissionAccumulated(
+        uint64 _nodeId,
+        uint256 _acc
+    ) internal view returns (uint256) {
+        return (tier360CommissionInfos[_nodeId].weight * _acc) / ACC_PRECISION;
     }
 
     function _accrueUnpaid(uint64 _nodeId, address _user) internal {
@@ -1395,54 +1501,34 @@ contract DGAIStaking is
     }
 
     function _accrueNodeCommission(uint64 _nodeId) internal {
-        uint256 delegatedAmount = nodeWeightCache[_nodeId];
-        if (delegatedAmount == 0) {
+        if (nodeWeightCache[_nodeId] == 0) {
             _resetNodeCommissionDebt(_nodeId);
             return;
         }
 
-        uint256 accumulated = _nodeCommissionAccumulated(
-            _nodeId,
-            _previewPoolAccRewardPerShare(NODE_POOL_ID)
-        );
-        uint256 debt = nodeDelegatedRewardDebt[_nodeId];
-        uint256 gross = accumulated > debt ? accumulated - debt : 0;
-        uint256 fee = (gross * commissionRate) / BPS_DENOMINATOR;
+        uint256 acc = _previewPoolAccRewardPerShare(NODE_POOL_ID);
+        uint256 regularAccumulated = _nodeCommissionAccumulated(_nodeId, acc);
+        uint256 regularDebt = nodeDelegatedRewardDebt[_nodeId];
+        uint256 regularGross = regularAccumulated > regularDebt
+            ? regularAccumulated - regularDebt
+            : 0;
+
+        TierCommissionInfo storage tierInfo = tier360CommissionInfos[_nodeId];
+        uint256 tierAccumulated = _tier360CommissionAccumulated(_nodeId, acc);
+        uint256 tierGross = tierAccumulated > tierInfo.rewardDebt
+            ? tierAccumulated - tierInfo.rewardDebt
+            : 0;
+
+        uint256 fee = (regularGross * commissionRate) /
+            BPS_DENOMINATOR +
+            (tierGross * tier360CommissionRate) /
+            BPS_DENOMINATOR;
 
         if (fee > 0) {
             nodeCommissionUnpaid[_nodeId] += fee;
         }
         _resetNodeCommissionDebt(_nodeId);
     }
-
-    // function _accrueLlmUnpaid(address _user) internal {
-    //     uint256 amount = llmUserAmount[_user];
-    //     if (amount == 0) {
-    //         return;
-    //     }
-
-    //     uint256 accumulated = (amount * accRewardPerShares[LLM_POOL_ID]) /
-    //         ACC_PRECISION;
-    //     uint256 debt = llmUserRewardDebt[_user];
-    //     uint256 pending = accumulated > debt ? accumulated - debt : 0;
-
-    //     if (pending > 0) {
-    //         llmUserUnpaid[_user] += pending;
-    //     }
-    //     _resetLlmDebt(_user);
-    // }
-
-    // function _accrueTeamUnpaid() internal {
-    //     uint256 accumulated = (TEAM_SHARE * accRewardPerShares[TEAM_POOL_ID]) /
-    //         ACC_PRECISION;
-    //     uint256 debt = teamRewardDebt;
-    //     uint256 pending = accumulated > debt ? accumulated - debt : 0;
-
-    //     if (pending > 0) {
-    //         teamUnpaid += pending;
-    //     }
-    //     _resetTeamDebt();
-    // }
 
     function _resetDebt(uint64 _nodeId, address _user) internal {
         uint64[] storage days_ = userDays[_nodeId][_user];
@@ -1468,24 +1554,14 @@ contract DGAIStaking is
     }
 
     function _resetNodeCommissionDebt(uint64 _nodeId) internal {
+        uint256 acc = accRewardPerShares[NODE_POOL_ID];
         nodeDelegatedRewardDebt[_nodeId] = _nodeCommissionAccumulated(
             _nodeId,
-            // _nodeAcc(_nodeId)
-            accRewardPerShares[NODE_POOL_ID]
+            acc
         );
+        tier360CommissionInfos[_nodeId]
+            .rewardDebt = _tier360CommissionAccumulated(_nodeId, acc);
     }
-
-    // function _resetLlmDebt(address _user) internal {
-    //     llmUserRewardDebt[_user] =
-    //         (llmUserAmount[_user] * accRewardPerShares[LLM_POOL_ID]) /
-    //         ACC_PRECISION;
-    // }
-
-    // function _resetTeamDebt() internal {
-    //     teamRewardDebt =
-    //         (TEAM_SHARE * accRewardPerShares[TEAM_POOL_ID]) /
-    //         ACC_PRECISION;
-    // }
 
     /// @notice Emergency withdraw surplus DGAI (reward pool funds), user principal is protected.
     /// @dev Owner can only withdraw the amount exceeding totalPrincipal (user staked + pending unstake principal).
